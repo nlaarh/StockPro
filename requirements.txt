@@ -1,0 +1,14 @@
+streamlit
+yfinance
+plotly
+pandas
+python-dotenv
+scikit-learn
+numpy
+ta
+requests
+nltk
+textblob
+transformers
+torch
+accelerate

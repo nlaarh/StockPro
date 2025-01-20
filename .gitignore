@@ -22,8 +22,10 @@ wheels/
 
 # Virtual Environment
 venv/
+stockpro_env_311/
 ENV/
 env/
+.env
 
 # IDE
 .idea/

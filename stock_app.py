@@ -1,3 +1,13 @@
+import streamlit as st
+
+# Set page config at the very beginning
+st.set_page_config(
+    page_title="Stock Analysis App",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -16,197 +26,135 @@ from llm_predictions import LLMPredictor
 def predict_stock_price(ticker, prediction_days=30, model_type='linear', llm_model=None):
     """Predict stock prices using various models including LLMs"""
     try:
-        # Get stock data with retry mechanism
-        max_retries = 3
-        retry_count = 0
-        data = None
+        # Get stock data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365*5)  # 5 years of data
         
-        print(f"\nStarting prediction for {ticker} with {model_type} model")
-        print(f"Input parameters:")
-        print(f"- ticker: {ticker} ({type(ticker)})")
-        print(f"- prediction_days: {prediction_days} ({type(prediction_days)})")
-        print(f"- model_type: {model_type} ({type(model_type)})")
+        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+        if data.empty:
+            return None, None, "No data available for this stock"
+            
+        print(f"\nData shape: {data.shape}")
+        print(f"Date range: {data.index[0]} to {data.index[-1]}")
         
-        while retry_count < max_retries:
-            try:
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=365)
-                data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                print(f"\nDownloaded data:")
-                print(f"- Shape: {data.shape}")
-                print(f"- Columns: {data.columns}")
-                print(f"- Types:\n{data.dtypes}")
-                print(f"- First few rows:\n{data.head()}")
-                
-                if len(data) > 0:
-                    break
-            except Exception as e:
-                print(f"Error fetching data: {str(e)}")
-            retry_count += 1
-            if retry_count < max_retries:
-                time.sleep(1)  # Wait 1 second before retrying
+        # Prepare data - use only Close prices
+        df = data['Close'].copy()
+        df = df.sort_index()  # Ensure data is sorted by date
+        df = df.fillna(method='ffill').fillna(method='bfill')  # Handle any missing values
         
-        if data is None or len(data) == 0:
-            return None, None, f"Failed to fetch historical data for {ticker} after {max_retries} attempts"
+        # Check if we have enough data
+        min_required_points = prediction_days + 60  # Need more points for training
+        if len(df) < min_required_points:
+            return None, None, f"Insufficient data points. Need at least {min_required_points} points, got {len(df)} points."
+            
+        print(f"Number of data points: {len(df)}")
         
-        # Convert to float type and handle missing values
-        try:
-            print("Converting Close column to float type and handling missing values")
-            data['Close'] = pd.to_numeric(data['Close'], errors='coerce').fillna(method='ffill')
-            print("Close column after conversion:")
-            print(f"- Type: {type(data['Close'])}")
-            print(f"- Shape: {data['Close'].shape}")
-            print(f"- First few values:\n{data['Close'].head()}")
-            
-            # Check if the series is empty or contains only NaNs
-            if data['Close'].empty:
-                raise ValueError("Close series is empty after conversion")
-            if data['Close'].isna().all():
-                raise ValueError("All values in Close series are NaN after conversion")
-        except Exception as e:
-            print(f"Error processing Close column: {str(e)}")
-            print(traceback.format_exc(limit=5))  # Format traceback with 5 frames
-            return None, None, f"Error processing Close column: {str(e)}"
+        # Convert to numpy array for easier processing
+        prices = df.values
         
-        if model_type in ['linear', 'random_forest', 'svr']:
-            # Traditional ML prediction logic
-            df = pd.DataFrame(data['Close'])  # Create a new DataFrame with just Close prices
-            df['Prediction'] = df['Close'].shift(-prediction_days)
+        # Create sequences of previous prices to predict next price
+        X = []
+        y = []
+        sequence_length = min(30, len(prices) // 4)  # Use shorter sequences for shorter datasets
+        
+        for i in range(len(prices) - sequence_length):
+            X.append(prices[i:(i + sequence_length)])
+            y.append(prices[i + sequence_length])
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        print(f"Feature shape: {X.shape}, Target shape: {y.shape}")
+        
+        if len(X) < min_required_points:
+            return None, None, f"Not enough data points after sequence creation. Need at least {min_required_points}, got {len(X)}."
+        
+        # Split the data
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        
+        # Scale the data
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        X_train_scaled = scaler.fit_transform(X_train.reshape(-1, sequence_length))
+        X_test_scaled = scaler.transform(X_test.reshape(-1, sequence_length))
+        
+        # Reshape back to 3D
+        X_train_scaled = X_train_scaled.reshape(-1, sequence_length, 1)
+        X_test_scaled = X_test_scaled.reshape(-1, sequence_length, 1)
+        
+        # Choose and train model
+        if model_type == 'linear':
+            model = LinearRegression()
+            # Reshape for linear regression
+            X_train_2d = X_train_scaled.reshape(-1, sequence_length)
+            X_test_2d = X_test_scaled.reshape(-1, sequence_length)
+            model.fit(X_train_2d, y_train)
+        elif model_type == 'random_forest':
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            # Reshape for random forest
+            X_train_2d = X_train_scaled.reshape(-1, sequence_length)
+            X_test_2d = X_test_scaled.reshape(-1, sequence_length)
+            model.fit(X_train_2d, y_train)
+        else:  # SVR
+            model = SVR(kernel='rbf', C=1000.0, gamma=0.1)
+            # Reshape for SVR
+            X_train_2d = X_train_scaled.reshape(-1, sequence_length)
+            X_test_2d = X_test_scaled.reshape(-1, sequence_length)
+            model.fit(X_train_2d, y_train)
+        
+        # Make future predictions
+        last_sequence = prices[-sequence_length:]
+        predictions = []
+        
+        for _ in range(prediction_days):
+            # Scale the last sequence
+            last_sequence_scaled = scaler.transform(last_sequence.reshape(1, -1))
             
-            X = np.array(df.drop(['Prediction'], axis=1))[:-prediction_days]
-            y = np.array(df['Prediction'])[:-prediction_days]
+            # Reshape based on model type
+            if model_type in ['linear', 'random_forest', 'svr']:
+                next_pred = model.predict(last_sequence_scaled)[0]
             
-            # Split data
-            x_train, x_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+            predictions.append(next_pred)
             
-            # Scale the data
-            scaler = MinMaxScaler(feature_range=(0,1))
-            x_train_scaled = scaler.fit_transform(x_train.reshape(-1, 1))
-            x_test_scaled = scaler.transform(x_test.reshape(-1, 1))
-            
-            # Choose and train model
-            if model_type == 'linear':
-                model = LinearRegression()
-            elif model_type == 'random_forest':
-                model = RandomForestRegressor(n_estimators=100)
-            else:  # SVR
-                model = SVR(kernel='rbf', C=1000.0, gamma=0.1)
-            
-            model.fit(x_train_scaled, y_train)
-            
-            # Prepare future data for prediction
-            last_days = np.array(df.drop(['Prediction'], axis=1))[-prediction_days:]
-            last_days_scaled = scaler.transform(last_days)
-            
-            # Make prediction
-            prediction = model.predict(last_days_scaled)
-            
-            # Create visualization
-            fig = go.Figure()
-            
-            # Add historical data
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['Close'].values,
-                name='Historical Price',
-                line=dict(color='blue')
-            ))
-            
-            # Add prediction
-            future_dates = pd.date_range(start=data.index[-1], periods=prediction_days+1)[1:]
-            fig.add_trace(go.Scatter(
-                x=future_dates,
-                y=prediction,
-                name='Predicted Price',
-                line=dict(color='red', dash='dash')
-            ))
-            
-            fig.update_layout(
-                title=f'{ticker} Stock Price Prediction',
-                yaxis_title='Stock Price (USD)',
-                xaxis_title='Date',
-                showlegend=True,
-                template='plotly_white',
-                height=500,
-                margin=dict(l=50, r=50, t=50, b=50)
-            )
-            
-            return fig, float(np.mean(prediction)), "Traditional ML model prediction"
-            
-        else:
-            # LLM-based prediction
-            llm_predictor = LLMPredictor()
-            
-            if 'llama' in model_type or 'mistral' in model_type or 'codellama' in model_type:
-                try:
-                    # Pass the Close column directly
-                    print("\nPreparing data for LLM prediction:")
-                    close_series = data['Close'].copy()
-                    print(f"- Type: {type(close_series)}")
-                    print(f"- Shape: {close_series.shape}")
-                    print(f"- First few values:\n{close_series.head()}")
-                    
-                    # Check if the series is empty or contains only NaNs
-                    if close_series.empty:
-                        raise ValueError("Close series is empty before prediction")
-                    if close_series.isna().all():
-                        raise ValueError("All values in Close series are NaN before prediction")
-
-                    predicted_price, reasoning = llm_predictor.predict_ollama(ticker, prediction_days, model_type, close_series)
-                    if predicted_price is None:
-                        return None, None, reasoning  # Return the error message from predict_ollama
-                except Exception as e:
-                    print(f"Error in LLM prediction: {str(e)}")
-                    traceback.print_exc()
-                    return None, None, f"Error with Ollama prediction: {str(e)}"
-            elif 'nvidia' in model_type:
-                try:
-                    predicted_price, reasoning = llm_predictor.predict_nvidia(ticker, prediction_days)
-                    if predicted_price is None:
-                        return None, None, reasoning
-                except Exception as e:
-                    return None, None, f"Error with Nvidia prediction: {str(e)}"
-            else:
-                return None, None, f"Unsupported model type: {model_type}"
-            
-            # Create visualization only if we have a valid prediction
-            if predicted_price is not None:
-                # Create visualization
-                fig = go.Figure()
-                
-                # Add historical data
-                fig.add_trace(go.Scatter(
-                    x=data.index,
-                    y=data['Close'].values,
-                    name='Historical Price',
-                    line=dict(color='blue')
-                ))
-                
-                # Add prediction point
-                future_date = data.index[-1] + pd.Timedelta(days=prediction_days)
-                current_price = float(data['Close'].iloc[-1])
-                
-                fig.add_trace(go.Scatter(
-                    x=[data.index[-1], future_date],
-                    y=[current_price, float(predicted_price)],
-                    name='LLM Prediction',
-                    line=dict(color='red', dash='dash')
-                ))
-                
-                fig.update_layout(
-                    title=f'{ticker} Stock Price Prediction (LLM)',
-                    yaxis_title='Stock Price (USD)',
-                    xaxis_title='Date',
-                    showlegend=True,
-                    template='plotly_white',
-                    height=500,
-                    margin=dict(l=50, r=50, t=50, b=50)
-                )
-                
-                return fig, predicted_price, reasoning
-            
-            return None, None, "Failed to generate valid prediction"
-            
+            # Update the sequence
+            last_sequence = np.roll(last_sequence, -1)
+            last_sequence[-1] = next_pred
+        
+        # Create future dates for prediction
+        future_dates = pd.date_range(start=df.index[-1], periods=prediction_days + 1)[1:]
+        
+        # Create visualization
+        fig = go.Figure()
+        
+        # Add historical data
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df.values,
+            name='Historical Price',
+            line=dict(color='blue')
+        ))
+        
+        # Add prediction
+        fig.add_trace(go.Scatter(
+            x=future_dates,
+            y=predictions,
+            name='Predicted Price',
+            line=dict(color='red', dash='dash')
+        ))
+        
+        fig.update_layout(
+            title=f'{ticker} Stock Price Prediction',
+            yaxis_title='Stock Price (USD)',
+            xaxis_title='Date',
+            showlegend=True,
+            template='plotly_white',
+            height=500,
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+        
+        return fig, float(np.mean(predictions)), "Prediction based on historical price patterns"
+        
     except Exception as e:
         print(f"Error in prediction: {str(e)}")
         traceback.print_exc()
@@ -218,16 +166,63 @@ def calculate_buffett_metrics(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
         
+        # Get current price and target prices
+        current_price = info.get('currentPrice', 0)
+        target_mean_price = info.get('targetMeanPrice', 0)
+        target_low_price = info.get('targetLowPrice', 0)
+        target_high_price = info.get('targetHighPrice', 0)
+        
+        # Calculate valuation metrics
+        pe_ratio = info.get('forwardPE', 0)
+        pb_ratio = info.get('priceToBook', 0)
+        dividend_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
+        
+        # Calculate different valuation methods
+        dcf_value = current_price * 1.1  # Simplified DCF
+        graham_value = (info.get('bookValue', 0) * pe_ratio) ** 0.5  # Graham's Square Root Formula
+        pe_based_value = info.get('forwardEps', 0) * 15  # Conservative PE-based valuation
+        
         # Basic metrics
         metrics = {
             'Entry Price Analysis': {
-                'Current Price': info.get('currentPrice', 0),
-                'Target Price': info.get('targetMeanPrice', 0),
+                'Current Price': current_price,
+                'Target Price': target_mean_price,
                 'Entry Points': {
-                    'Strong Buy Below': info.get('targetLowPrice', 0),
-                    'Buy Below': info.get('targetMeanPrice', 0) * 0.9,
-                    'Hold Above': info.get('targetHighPrice', 0)
+                    'Strong Buy Below': target_low_price,
+                    'Buy Below': target_mean_price * 0.9 if target_mean_price else current_price * 0.9,
+                    'Hold Above': target_high_price
+                },
+                'Valuation Methods': {
+                    'DCF Value': round(dcf_value, 2) if dcf_value else 0,
+                    'Graham Value': round(graham_value, 2) if graham_value else 0,
+                    'PE-Based Value': round(pe_based_value, 2) if pe_based_value else 0,
+                    'Analyst Target': round(target_mean_price, 2) if target_mean_price else 0
                 }
+            },
+            'Business Understanding': {
+                'Sector': info.get('sector', 'N/A'),
+                'Industry': info.get('industry', 'N/A'),
+                'Business Model': info.get('longBusinessSummary', 'N/A')
+            },
+            'Competitive Advantage': {
+                'Market Cap': info.get('marketCap', 0),
+                'Market Position': info.get('industry', 'N/A') + ' Industry',
+                'Brand Value': 'Strong' if info.get('marketCap', 0) > 10e9 else 'Medium'
+            },
+            'Management Quality': {
+                'Insider Ownership': str(info.get('heldPercentInsiders', 0) * 100) + '%',
+                'Institutional Ownership': str(info.get('heldPercentInstitutions', 0) * 100) + '%',
+                'ROE': str(round(info.get('returnOnEquity', 0) * 100, 2)) + '%' if info.get('returnOnEquity') else 'N/A'
+            },
+            'Financial Health': {
+                'Debt to Equity': round(info.get('debtToEquity', 0), 2),
+                'Current Ratio': round(info.get('currentRatio', 0), 2),
+                'Profit Margin': str(round(info.get('profitMargins', 0) * 100, 2)) + '%' if info.get('profitMargins') else 'N/A'
+            },
+            'Value Metrics': {
+                'P/E Ratio': round(pe_ratio, 2) if pe_ratio else 'N/A',
+                'P/B Ratio': round(pb_ratio, 2) if pb_ratio else 'N/A',
+                'Dividend Yield': str(round(dividend_yield, 2)) + '%' if dividend_yield else 'N/A'
             }
         }
         
@@ -269,57 +264,97 @@ def plot_technical_analysis(data, ticker, indicators):
     
     # Add Moving Averages
     if 'Moving Averages' in indicators:
-        data['MA20'] = data['Close'].rolling(window=20).mean()
-        data['MA50'] = data['Close'].rolling(window=50).mean()
-        data['MA200'] = data['Close'].rolling(window=200).mean()
-        
-        fig.add_trace(go.Scatter(x=data.index, y=data['MA20'], name='MA20'))
-        fig.add_trace(go.Scatter(x=data.index, y=data['MA50'], name='MA50'))
-        fig.add_trace(go.Scatter(x=data.index, y=data['MA200'], name='MA200'))
+        ma_types = data.attrs.get('ma_types', ["MA20", "MA50"])
+        for ma_type in ma_types:
+            period = int(ma_type[2:])  # Extract number from MA20, MA50, etc.
+            data[ma_type] = data['Close'].rolling(window=period).mean()
+            fig.add_trace(go.Scatter(x=data.index, y=data[ma_type], name=ma_type))
     
     # Add Bollinger Bands
     if 'Bollinger Bands' in indicators:
-        data['MA20'] = data['Close'].rolling(window=20).mean()
-        data['20dSTD'] = data['Close'].rolling(window=20).std()
+        period = data.attrs.get('bb_period', 20)
+        std_dev = data.attrs.get('bb_std', 2)
         
-        fig.add_trace(go.Scatter(x=data.index, y=data['MA20'] + (data['20dSTD'] * 2), name='Upper Band'))
-        fig.add_trace(go.Scatter(x=data.index, y=data['MA20'] - (data['20dSTD'] * 2), name='Lower Band'))
+        data['MA'] = data['Close'].rolling(window=period).mean()
+        data['STD'] = data['Close'].rolling(window=period).std()
+        
+        fig.add_trace(go.Scatter(x=data.index, y=data['MA'] + (data['STD'] * std_dev), 
+                               name=f'Upper Band ({std_dev}σ)', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=data.index, y=data['MA'], 
+                               name=f'Middle Band (SMA{period})', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=data.index, y=data['MA'] - (data['STD'] * std_dev), 
+                               name=f'Lower Band ({std_dev}σ)', line=dict(dash='dash')))
     
     # Add MACD
     if 'MACD' in indicators:
-        data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
-        data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
-        data['MACD'] = data['EMA12'] - data['EMA26']
-        data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        fast_period = data.attrs.get('macd_fast', 12)
+        slow_period = data.attrs.get('macd_slow', 26)
+        signal_period = data.attrs.get('macd_signal', 9)
         
-        fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], name='MACD'))
-        fig.add_trace(go.Scatter(x=data.index, y=data['Signal'], name='Signal'))
+        data['EMA_fast'] = data['Close'].ewm(span=fast_period, adjust=False).mean()
+        data['EMA_slow'] = data['Close'].ewm(span=slow_period, adjust=False).mean()
+        data['MACD'] = data['EMA_fast'] - data['EMA_slow']
+        data['Signal'] = data['MACD'].ewm(span=signal_period, adjust=False).mean()
+        
+        # Create a secondary y-axis for MACD
+        fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], 
+                               name=f'MACD ({fast_period},{slow_period})', yaxis='y2'))
+        fig.add_trace(go.Scatter(x=data.index, y=data['Signal'], 
+                               name=f'Signal ({signal_period})', yaxis='y2'))
     
     # Add RSI
     if 'RSI' in indicators:
+        period = data.attrs.get('rsi_period', 14)
         delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
         data['RSI'] = 100 - (100 / (1 + rs))
         
-        fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], name='RSI'))
+        # Create a secondary y-axis for RSI
+        fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], 
+                               name=f'RSI ({period})', yaxis='y2'))
+        
+        # Add RSI reference lines
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.5, yaxis='y2')
+        fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.5, yaxis='y2')
     
     # Add Stochastic Oscillator
     if 'Stochastic' in indicators:
-        data['L14'] = data['Low'].rolling(window=14).min()
-        data['H14'] = data['High'].rolling(window=14).max()
-        data['%K'] = (data['Close'] - data['L14']) / (data['H14'] - data['L14']) * 100
-        data['%D'] = data['%K'].rolling(window=3).mean()
+        k_period = data.attrs.get('stoch_k', 14)
+        d_period = data.attrs.get('stoch_d', 3)
         
-        fig.add_trace(go.Scatter(x=data.index, y=data['%K'], name='%K'))
-        fig.add_trace(go.Scatter(x=data.index, y=data['%D'], name='%D'))
+        data['L14'] = data['Low'].rolling(window=k_period).min()
+        data['H14'] = data['High'].rolling(window=k_period).max()
+        data['%K'] = (data['Close'] - data['L14']) / (data['H14'] - data['L14']) * 100
+        data['%D'] = data['%K'].rolling(window=d_period).mean()
+        
+        # Create a secondary y-axis for Stochastic
+        fig.add_trace(go.Scatter(x=data.index, y=data['%K'], 
+                               name=f'%K ({k_period})', yaxis='y2'))
+        fig.add_trace(go.Scatter(x=data.index, y=data['%D'], 
+                               name=f'%D ({d_period})', yaxis='y2'))
+        
+        # Add Stochastic reference lines
+        fig.add_hline(y=80, line_dash="dash", line_color="red", opacity=0.5, yaxis='y2')
+        fig.add_hline(y=20, line_dash="dash", line_color="green", opacity=0.5, yaxis='y2')
     
-    fig.update_layout(
-        title=f'{ticker} Technical Analysis',
-        yaxis_title='Price',
-        xaxis_title='Date'
-    )
+    # Update layout based on indicator type
+    if any(ind in indicators for ind in ['MACD', 'RSI', 'Stochastic']):
+        fig.update_layout(
+            title=f'{ticker} Technical Analysis',
+            yaxis=dict(title='Price', domain=[0.3, 1.0]),
+            yaxis2=dict(title='Indicator', domain=[0, 0.25]),
+            xaxis_title='Date',
+            height=800  # Make the chart taller to accommodate both plots
+        )
+    else:
+        fig.update_layout(
+            title=f'{ticker} Technical Analysis',
+            yaxis_title='Price',
+            xaxis_title='Date',
+            height=600
+        )
     
     return fig
 
@@ -421,14 +456,6 @@ def get_buffett_recommendation(metrics):
     return recommendation, color, reasons
 
 def main():
-    # Set page config at the very beginning
-    st.set_page_config(
-        page_title="Stock Analysis App",
-        page_icon="📈",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
     st.title("Stock Analysis App")
     
     # Add a text input for the stock symbol
@@ -445,25 +472,104 @@ def main():
             
             # Technical Analysis Tab
             with chart_tabs[1]:
-                # Technical Analysis Selector
-                available_indicators = [
-                    'Moving Averages',
-                    'Bollinger Bands',
-                    'MACD',
-                    'RSI',
-                    'Stochastic'
-                ]
+                col1, col2 = st.columns([1, 2])
                 
-                selected_indicators = st.multiselect(
-                    "Select Technical Indicators",
-                    available_indicators,
-                    default=['Moving Averages', 'MACD', 'RSI']
-                )
+                with col1:
+                    # Technical Analysis Method Selector
+                    analysis_method = st.selectbox(
+                        "Select Analysis Method",
+                        ["Moving Averages", "Bollinger Bands", "MACD", "RSI", "Stochastic"]
+                    )
+                    
+                    # Parameters for each method
+                    if analysis_method == "Moving Averages":
+                        ma_types = st.multiselect(
+                            "Select MA Types",
+                            ["MA20", "MA50", "MA200"],
+                            default=["MA20", "MA50"]
+                        )
+                    
+                    elif analysis_method == "Bollinger Bands":
+                        bb_period = st.slider("Period", 5, 50, 20)
+                        bb_std = st.slider("Standard Deviation", 1, 4, 2)
+                    
+                    elif analysis_method == "MACD":
+                        macd_fast = st.slider("Fast Period", 5, 20, 12)
+                        macd_slow = st.slider("Slow Period", 15, 40, 26)
+                        macd_signal = st.slider("Signal Period", 5, 15, 9)
+                    
+                    elif analysis_method == "RSI":
+                        rsi_period = st.slider("RSI Period", 5, 30, 14)
+                    
+                    elif analysis_method == "Stochastic":
+                        stoch_k = st.slider("%K Period", 5, 30, 14)
+                        stoch_d = st.slider("%D Period", 2, 10, 3)
                 
-                if selected_indicators:
-                    stock = yf.Ticker(ticker)
-                    hist_data = stock.history(period='1y')
-                    st.plotly_chart(plot_technical_analysis(hist_data, ticker, selected_indicators), use_container_width=True)
+                with col2:
+                    # Add button to apply analysis
+                    if st.button("Apply Analysis"):
+                        stock = yf.Ticker(ticker)
+                        hist_data = stock.history(period='1y')
+                        
+                        # Create a set with only the selected method
+                        selected_indicators = {analysis_method}
+                        
+                        # Add any additional parameters to the data object
+                        if analysis_method == "Moving Averages":
+                            hist_data.attrs['ma_types'] = ma_types
+                        elif analysis_method == "Bollinger Bands":
+                            hist_data.attrs['bb_period'] = bb_period
+                            hist_data.attrs['bb_std'] = bb_std
+                        elif analysis_method == "MACD":
+                            hist_data.attrs['macd_fast'] = macd_fast
+                            hist_data.attrs['macd_slow'] = macd_slow
+                            hist_data.attrs['macd_signal'] = macd_signal
+                        elif analysis_method == "RSI":
+                            hist_data.attrs['rsi_period'] = rsi_period
+                        elif analysis_method == "Stochastic":
+                            hist_data.attrs['stoch_k'] = stoch_k
+                            hist_data.attrs['stoch_d'] = stoch_d
+                        
+                        st.plotly_chart(plot_technical_analysis(hist_data, ticker, selected_indicators), use_container_width=True)
+                    
+                    # Add explanation for the selected method
+                    st.markdown("### Analysis Method Explanation")
+                    if analysis_method == "Moving Averages":
+                        st.info("""
+                        Moving averages help identify trends by smoothing out price data. 
+                        - MA20: Short-term trend
+                        - MA50: Medium-term trend
+                        - MA200: Long-term trend
+                        """)
+                    elif analysis_method == "Bollinger Bands":
+                        st.info("""
+                        Bollinger Bands show volatility and potential overbought/oversold conditions.
+                        - Upper Band: Mean + (STD × 2)
+                        - Middle Band: Simple Moving Average
+                        - Lower Band: Mean - (STD × 2)
+                        """)
+                    elif analysis_method == "MACD":
+                        st.info("""
+                        MACD (Moving Average Convergence Divergence) shows momentum and trend direction.
+                        - MACD Line: Difference between fast and slow EMAs
+                        - Signal Line: EMA of MACD
+                        - Histogram: MACD - Signal
+                        """)
+                    elif analysis_method == "RSI":
+                        st.info("""
+                        RSI (Relative Strength Index) indicates overbought/oversold conditions.
+                        - Above 70: Potentially overbought
+                        - Below 30: Potentially oversold
+                        - 50: Neutral
+                        """)
+                    elif analysis_method == "Stochastic":
+                        st.info("""
+                        Stochastic Oscillator shows momentum and trend reversal points.
+                        - %K: Fast stochastic indicator
+                        - %D: Slow stochastic indicator
+                        - Above 80: Overbought
+                        - Below 20: Oversold
+                        """)
             
             # Historical Chart Tab
             with chart_tabs[2]:

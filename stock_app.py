@@ -521,25 +521,37 @@ def analyze_trend(recent_df, predictions):
         
         # Generate trend signals
         signals = []
-        if price_change > 0:
-            signals.append("✅ Price is predicted to increase")
+        
+        # Moving Average signals
+        if current_price > recent_df['MA20'].iloc[-1]:
+            signals.append("✅ Price above 20-day MA (Short-term bullish)")
         else:
-            signals.append("🔻 Price is predicted to decrease")
+            signals.append("🔴 Price below 20-day MA (Short-term bearish)")
             
+        if current_price > recent_df['MA50'].iloc[-1]:
+            signals.append("✅ Price above 50-day MA (Medium-term bullish)")
+        else:
+            signals.append("🔴 Price below 50-day MA (Medium-term bearish)")
+            
+        if recent_df['MA20'].iloc[-1] > recent_df['MA50'].iloc[-1]:
+            signals.append("✅ Golden Cross: 20-day MA above 50-day MA (Bullish)")
+        else:
+            signals.append("🔴 Death Cross: 20-day MA below 50-day MA (Bearish)")
+            
+        # RSI signals
         if rsi > 70:
-            signals.append("⚠️ Stock may be overbought (RSI > 70)")
+            signals.append("⚠️ RSI above 70 (Overbought)")
         elif rsi < 30:
-            signals.append("💡 Stock may be oversold (RSI < 30)")
-            
-        if macd > 0:
-            signals.append("✅ MACD indicates bullish momentum")
+            signals.append("💡 RSI below 30 (Oversold)")
         else:
-            signals.append("🔻 MACD indicates bearish momentum")
+            signals.append("✅ RSI between 30-70 (Neutral)")
             
-        if volume_change > 10:
-            signals.append("📈 Trading volume is increasing")
-        elif volume_change < -10:
-            signals.append("📉 Trading volume is decreasing")
+        # MACD signals
+        if 'MACD' in recent_df.columns:
+            if macd > 0:
+                signals.append("✅ MACD above 0 (Bullish)")
+            else:
+                signals.append("🔴 MACD below 0 (Bearish)")
         
         # Generate trend data
         trend_data = "### Technical Signals\n\n" + "\n".join(signals)
@@ -930,7 +942,7 @@ def calculate_buffett_metrics(ticker):
             },
             'Value Metrics': {
                 'Market Cap': f"${market_cap/1e9:.1f}B",
-                'P/E Ratio': info.get('forwardPE', 'N/A'),
+                'P/E Ratio': info.get('forwardPE', 0),
                 'Book Value': f"${book_value_per_share:.2f}/share"
             },
             'Entry Price Analysis': {
@@ -1044,145 +1056,179 @@ def technical_analysis_tab():
     try:
         st.header("Technical Analysis")
         
-        # Get the stock data
-        ticker = st.session_state.get('main_ticker', 'AAPL')
-        if not ticker:
-            st.warning("Please enter a stock symbol")
-            return
-            
-        # Fetch data
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1y")
-        
-        if hist.empty:
-            st.error(f"No data available for {ticker}")
-            return
-            
-        # Calculate technical indicators
-        hist['MA20'] = hist['Close'].rolling(window=20).mean()
-        hist['MA50'] = hist['Close'].rolling(window=50).mean()
-        hist['RSI'] = calculate_rsi(hist['Close'])
-        macd = calculate_macd(hist['Close'])
-        if macd is not None:
-            hist['MACD'] = macd
-        
-        # Create technical analysis plots
-        fig = make_subplots(rows=3, cols=1, shared_xaxis=True,
-                           vertical_spacing=0.05,
-                           subplot_titles=('Price and Moving Averages', 'RSI', 'MACD'))
-        
-        # Plot 1: Price and Moving Averages
-        fig.add_trace(go.Candlestick(x=hist.index,
-                                    open=hist['Open'],
-                                    high=hist['High'],
-                                    low=hist['Low'],
-                                    close=hist['Close'],
-                                    name='Price'),
-                     row=1, col=1)
-        
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['MA20'],
-                                name='20-day MA',
-                                line=dict(color='orange')),
-                     row=1, col=1)
-        
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['MA50'],
-                                name='50-day MA',
-                                line=dict(color='blue')),
-                     row=1, col=1)
-        
-        # Plot 2: RSI
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['RSI'],
-                                name='RSI',
-                                line=dict(color='purple')),
-                     row=2, col=1)
-        
-        # Add RSI levels
-        fig.add_hline(y=70, line_dash="dash", line_color="red",
-                     annotation_text="Overbought (70)", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green",
-                     annotation_text="Oversold (30)", row=2, col=1)
-        
-        # Plot 3: MACD
-        if 'MACD' in hist.columns:
-            fig.add_trace(go.Scatter(x=hist.index, y=hist['MACD'],
-                                    name='MACD',
-                                    line=dict(color='blue')),
-                         row=3, col=1)
-        
-        # Update layout
-        fig.update_layout(
-            height=800,
-            xaxis_rangeslider_visible=False,
-            showlegend=True
-        )
-        
-        # Display the plot
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Technical Analysis Summary
-        st.subheader("Technical Analysis Summary")
-        
-        # Current values
-        current_price = hist['Close'].iloc[-1]
-        ma20 = hist['MA20'].iloc[-1]
-        ma50 = hist['MA50'].iloc[-1]
-        rsi = hist['RSI'].iloc[-1]
-        macd_value = hist.get('MACD', pd.Series([0])).iloc[-1]
-        
-        # Create metrics
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns([1, 2])
         
         with col1:
-            st.metric("Current Price", f"${current_price:.2f}")
-            st.metric("20-day MA", f"${ma20:.2f}")
+            # Get user input
+            ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="ta_ticker").upper()
             
+            # Multiple indicator selection
+            selected_indicators = st.multiselect(
+                "Select Technical Indicators",
+                ["Moving Averages", "RSI", "MACD", "Bollinger Bands", "Volume"],
+                default=["Moving Averages"]
+            )
+            
+            # Parameters for each indicator
+            if "Moving Averages" in selected_indicators:
+                ma_periods = st.multiselect(
+                    "Select MA Periods",
+                    ["MA20", "MA50", "MA200"],
+                    default=["MA20", "MA50"]
+                )
+            
+            if "Bollinger Bands" in selected_indicators:
+                bb_period = st.slider("Bollinger Period", 5, 50, 20)
+                bb_std = st.slider("Bollinger Std Dev", 1, 4, 2)
+            
+            if "MACD" in selected_indicators:
+                macd_fast = st.slider("MACD Fast Period", 5, 20, 12)
+                macd_slow = st.slider("MACD Slow Period", 15, 40, 26)
+                macd_signal = st.slider("MACD Signal Period", 5, 15, 9)
+            
+            if "RSI" in selected_indicators:
+                rsi_period = st.slider("RSI Period", 5, 30, 14)
+        
         with col2:
-            st.metric("50-day MA", f"${ma50:.2f}")
-            st.metric("RSI", f"{rsi:.1f}")
-            
-        with col3:
-            if 'MACD' in hist.columns:
-                st.metric("MACD", f"{macd_value:.3f}")
-            
-        # Technical signals
-        signals = []
-        
-        # Moving Average signals
-        if current_price > ma20:
-            signals.append("✅ Price above 20-day MA (Short-term bullish)")
-        else:
-            signals.append("🔴 Price below 20-day MA (Short-term bearish)")
-            
-        if current_price > ma50:
-            signals.append("✅ Price above 50-day MA (Medium-term bullish)")
-        else:
-            signals.append("🔴 Price below 50-day MA (Medium-term bearish)")
-            
-        if ma20 > ma50:
-            signals.append("✅ Golden Cross: 20-day MA above 50-day MA (Bullish)")
-        else:
-            signals.append("🔴 Death Cross: 20-day MA below 50-day MA (Bearish)")
-            
-        # RSI signals
-        if rsi > 70:
-            signals.append("⚠️ RSI above 70 (Overbought)")
-        elif rsi < 30:
-            signals.append("💡 RSI below 30 (Oversold)")
-        else:
-            signals.append("✅ RSI between 30-70 (Neutral)")
-            
-        # MACD signals
-        if 'MACD' in hist.columns:
-            if macd_value > 0:
-                signals.append("✅ MACD above 0 (Bullish)")
-            else:
-                signals.append("🔴 MACD below 0 (Bearish)")
-        
-        # Display signals
-        st.subheader("Technical Signals")
-        for signal in signals:
-            st.write(signal)
-            
+            if st.button("Analyze"):
+                try:
+                    # Get stock data
+                    stock = yf.Ticker(ticker)
+                    hist_data = stock.history(period="1y")
+                    
+                    if hist_data.empty:
+                        st.error(f"No data found for {ticker}")
+                        return
+                    
+                    # Create figure with secondary y-axis
+                    fig = make_subplots(rows=3, cols=1, 
+                                      shared_xaxes=True,
+                                      vertical_spacing=0.05,
+                                      row_heights=[0.6, 0.2, 0.2])
+                    
+                    # Add candlestick chart
+                    fig.add_trace(go.Candlestick(
+                        x=hist_data.index,
+                        open=hist_data['Open'],
+                        high=hist_data['High'],
+                        low=hist_data['Low'],
+                        close=hist_data['Close'],
+                        name="OHLC"
+                    ), row=1, col=1)
+                    
+                    # Add selected indicators
+                    if "Moving Averages" in selected_indicators:
+                        for ma in ma_periods:
+                            period = int(ma.replace("MA", ""))
+                            ma_line = hist_data['Close'].rolling(window=period).mean()
+                            fig.add_trace(go.Scatter(
+                                x=hist_data.index,
+                                y=ma_line,
+                                name=f"{period} MA",
+                                line=dict(width=1)
+                            ), row=1, col=1)
+                    
+                    if "Bollinger Bands" in selected_indicators:
+                        ma = hist_data['Close'].rolling(window=bb_period).mean()
+                        std = hist_data['Close'].rolling(window=bb_period).std()
+                        upper_bb = ma + (std * bb_std)
+                        lower_bb = ma - (std * bb_std)
+                        
+                        fig.add_trace(go.Scatter(x=hist_data.index, y=upper_bb, name="Upper BB",
+                                               line=dict(dash='dash')), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=hist_data.index, y=lower_bb, name="Lower BB",
+                                               line=dict(dash='dash')), row=1, col=1)
+                    
+                    if "RSI" in selected_indicators:
+                        delta = hist_data['Close'].diff()
+                        gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
+                        rs = gain / loss
+                        rsi = 100 - (100 / (1 + rs))
+                        
+                        fig.add_trace(go.Scatter(x=hist_data.index, y=rsi, name="RSI"), row=2, col=1)
+                        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+                        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+                    
+                    if "MACD" in selected_indicators:
+                        exp1 = hist_data['Close'].ewm(span=macd_fast, adjust=False).mean()
+                        exp2 = hist_data['Close'].ewm(span=macd_slow, adjust=False).mean()
+                        macd = exp1 - exp2
+                        signal = macd.ewm(span=macd_signal, adjust=False).mean()
+                        histogram = macd - signal
+                        
+                        fig.add_trace(go.Scatter(x=hist_data.index, y=macd, name="MACD"), row=3, col=1)
+                        fig.add_trace(go.Scatter(x=hist_data.index, y=signal, name="Signal"), row=3, col=1)
+                        fig.add_trace(go.Bar(x=hist_data.index, y=histogram, name="Histogram"), row=3, col=1)
+                    
+                    if "Volume" in selected_indicators:
+                        colors = ['red' if row['Open'] - row['Close'] >= 0 
+                                 else 'green' for index, row in hist_data.iterrows()]
+                        fig.add_trace(go.Bar(x=hist_data.index, y=hist_data['Volume'],
+                                           marker_color=colors,
+                                           name="Volume"), row=3, col=1)
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title=f"{ticker} Technical Analysis",
+                        xaxis_title="Date",
+                        yaxis_title="Price",
+                        height=800,
+                        showlegend=True,
+                        xaxis_rangeslider_visible=False
+                    )
+                    
+                    # Show plot
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Add analysis explanation
+                    with st.expander("Technical Analysis Explanation"):
+                        if "Moving Averages" in selected_indicators:
+                            st.write("""
+                            **Moving Averages:**
+                            - Short-term MA (20 days): Quick to react to price changes
+                            - Medium-term MA (50 days): Moderate reaction to price changes
+                            - Long-term MA (200 days): Shows long-term trends
+                            - Crossovers between MAs can signal trend changes
+                            """)
+                        
+                        if "RSI" in selected_indicators:
+                            st.write("""
+                            **RSI (Relative Strength Index):**
+                            - Above 70: Potentially overbought
+                            - Below 30: Potentially oversold
+                            - Trend line breaks can signal reversals
+                            """)
+                        
+                        if "MACD" in selected_indicators:
+                            st.write("""
+                            **MACD (Moving Average Convergence Divergence):**
+                            - MACD Line: Short-term momentum
+                            - Signal Line: Trigger line for buy/sell signals
+                            - Histogram: Shows momentum strength
+                            - Signal line crossovers can indicate entry/exit points
+                            """)
+                        
+                        if "Bollinger Bands" in selected_indicators:
+                            st.write("""
+                            **Bollinger Bands:**
+                            - Upper/Lower bands show volatility
+                            - Price touching bands can signal potential reversals
+                            - Band squeeze (narrowing) can signal potential breakout
+                            """)
+                        
+                        if "Volume" in selected_indicators:
+                            st.write("""
+                            **Volume:**
+                            - Green: Closing price higher than opening price
+                            - Red: Closing price lower than opening price
+                            - High volume confirms trend strength
+                            - Low volume may signal weak trends
+                            """)
+                
+                except Exception as e:
+                    st.error(f"Error performing technical analysis: {str(e)}")
+                    
     except Exception as e:
         st.error(f"Error in technical analysis: {str(e)}")
         import traceback
@@ -1316,57 +1362,90 @@ def prediction_tab():
                     )
                     
                     if summary:
-                        with st.expander("📈 Detailed Prediction Analysis", expanded=True):
-                            st.markdown(summary)
+                        st.markdown(summary)
                     else:
                         st.warning("Could not generate prediction summary")
                 
                 with st.spinner("Creating visualization..."):
                     # Display prediction plot
+                    # Generate dates for x-axis
+                    last_date = hist.index[-1]
+                    future_dates = [last_date + timedelta(days=x) for x in range(prediction_days)]
+                    date_labels = [d.strftime('%m/%d/%Y') for d in future_dates]
+                    
+                    # Create figure
                     fig = go.Figure()
                     
-                    # Add actual prices
+                    # Plot historical data (last 30 days)
+                    historical_days = 30
+                    recent_hist = hist.tail(historical_days)
+                    hist_dates = recent_hist.index
+                    hist_date_labels = [d.strftime('%m/%d/%Y') for d in hist_dates]
+                    
                     fig.add_trace(go.Scatter(
-                        y=y_test,
-                        name="Actual Price",
+                        x=hist_date_labels,
+                        y=recent_hist['Close'],
+                        name='Historical',
                         line=dict(color='blue')
                     ))
                     
-                    # Add predicted prices
+                    # Plot predictions
                     fig.add_trace(go.Scatter(
+                        x=date_labels,
                         y=predictions,
-                        name="Predicted Price",
+                        name='Predicted',
                         line=dict(color='red', dash='dash')
                     ))
                     
                     # Add confidence bands if available
-                    if isinstance(confidence_bands, tuple) and len(confidence_bands) == 2:
-                        lower_bound, upper_bound = confidence_bands
-                        if lower_bound is not None and upper_bound is not None:
-                            fig.add_trace(go.Scatter(
-                                y=upper_bound,
-                                name="Upper Bound",
-                                line=dict(color='rgba(200,100,100,0.2)'),
-                                showlegend=False
-                            ))
-                            fig.add_trace(go.Scatter(
-                                y=lower_bound,
-                                name="Lower Bound",
-                                fill='tonexty',
-                                fillcolor='rgba(200,100,100,0.1)',
-                                line=dict(color='rgba(200,100,100,0.2)'),
-                                showlegend=False
-                            ))
+                    if confidence_bands is not None:
+                        lower_band, upper_band = confidence_bands
+                        
+                        # Plot confidence bands
+                        fig.add_trace(go.Scatter(
+                            x=date_labels,
+                            y=upper_band,
+                            name='Upper Band',
+                            line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
+                            showlegend=False
+                        ))
+                        
+                        fig.add_trace(go.Scatter(
+                            x=date_labels,
+                            y=lower_band,
+                            name='Lower Band',
+                            line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
+                            fill='tonexty',
+                            showlegend=False
+                        ))
                     
+                    # Update layout
                     fig.update_layout(
-                        title=f"{ticker} Stock Price Prediction",
-                        xaxis_title="Time",
-                        yaxis_title="Price",
-                        height=500
+                        title=f"{ticker} Stock Price Prediction ({last_date.strftime('%m/%d/%Y')} to {future_dates[-1].strftime('%m/%d/%Y')})",
+                        xaxis_title="Date",
+                        yaxis_title="Price ($)",
+                        hovermode='x unified',
+                        showlegend=True,
+                        xaxis=dict(
+                            type='category',
+                            tickmode='array',
+                            ticktext=hist_date_labels + date_labels,
+                            tickvals=list(range(len(hist_date_labels + date_labels))),
+                            tickangle=45
+                        )
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
                     
+                    # Generate and display prediction summary
+                    summary = generate_prediction_summary(
+                        ticker, hist, model_type, prediction_days,
+                        predictions, confidence_bands
+                    )
+                    
+                    if summary:
+                        st.markdown("### Prediction Analysis")
+                        st.write(summary)
             except Exception as e:
                 st.error(f"""
                 Error during prediction: {str(e)}
@@ -1507,7 +1586,7 @@ def analyze_stock_recommendation(ticker):
         sector = info.get('sector', 'N/A')
         industry = info.get('industry', 'N/A')
         market_cap = info.get('marketCap', 0) / 1e9  # Convert to billions
-        pe_ratio = info.get('forwardPE', 'N/A')
+        pe_ratio = info.get('forwardPE', 0)
         dividend_yield = info.get('dividendYield', 0)
         if dividend_yield:
             dividend_yield = dividend_yield * 100

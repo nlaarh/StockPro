@@ -1048,62 +1048,222 @@ def plot_stock_price(data, ticker):
                           x=0.5, y=0.5, showarrow=False)
         return fig
 
-def predict_stock_price(data, days=30, model_type='linear'):
-    """Predict stock prices using selected model"""
+def predict_stock_price(data, days=30, model_type='transformer', use_sentiment=True):
+    """Predict stock prices using advanced models including transformers and sentiment analysis"""
     try:
         import numpy as np
+        import torch
         from sklearn.preprocessing import StandardScaler
         from sklearn.linear_model import LinearRegression
         from sklearn.ensemble import RandomForestRegressor
         from sklearn.svm import SVR
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        import yfinance as yf
+        from datetime import datetime, timedelta
+        import plotly.graph_objects as go
         
         # Prepare data
         df = data.copy()
         df['Prediction'] = df['Close'].shift(-1)
-        df = df[['Close', 'Prediction']].dropna()
+        df = df[['Close', 'Volume', 'High', 'Low', 'Open', 'Prediction']].dropna()
+        
+        # Feature engineering
+        df['MA7'] = df['Close'].rolling(window=7).mean()
+        df['MA21'] = df['Close'].rolling(window=21).mean()
+        df['RSI'] = calculate_rsi(df['Close'])
+        df['MACD'] = calculate_macd(df['Close'])
+        df = df.dropna()
         
         # Create features and target
-        X = np.array(df['Close']).reshape(-1, 1)
-        y = np.array(df['Prediction']).reshape(-1, 1)
+        features = ['Close', 'Volume', 'High', 'Low', 'Open', 'MA7', 'MA21', 'RSI', 'MACD']
+        X = df[features].values
+        y = df['Prediction'].values
         
         # Scale the data
         scaler = StandardScaler()
         X = scaler.fit_transform(X)
         
-        # Select and train model
-        if model_type == 'linear':
-            model = LinearRegression()
-        elif model_type == 'random_forest':
-            model = RandomForestRegressor(n_estimators=100)
-        else:  # SVR
-            model = SVR(kernel='rbf')
+        # Initialize prediction
+        prediction = None
         
-        model.fit(X, y.ravel())
+        if model_type == 'transformer':
+            try:
+                # Use Hugging Face transformer model for sentiment analysis
+                model_name = "ProsusAI/finbert"
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForSequenceClassification.from_pretrained(model_name)
+                
+                # Get recent news sentiment
+                ticker_obj = yf.Ticker(data.name)
+                news = ticker_obj.news[:5]
+                sentiments = []
+                
+                for article in news:
+                    inputs = tokenizer(article.get('title', ''), return_tensors="pt", padding=True, truncation=True)
+                    outputs = model(**inputs)
+                    sentiment = torch.nn.functional.softmax(outputs.logits, dim=1)
+                    sentiments.append(sentiment[0][1].item())  # Positive sentiment score
+                
+                avg_sentiment = np.mean(sentiments) if sentiments else 0.5
+                
+                # Use LSTM for price prediction
+                from sklearn.preprocessing import MinMaxScaler
+                
+                # Prepare sequence data
+                scaler = MinMaxScaler()
+                scaled_data = scaler.fit_transform(df[['Close']].values)
+                
+                # Create sequences
+                seq_length = 60
+                sequences = []
+                targets = []
+                
+                for i in range(len(scaled_data) - seq_length):
+                    sequences.append(scaled_data[i:(i + seq_length), 0])
+                    targets.append(scaled_data[i + seq_length, 0])
+                
+                sequences = np.array(sequences)
+                targets = np.array(targets)
+                
+                # Create and train LSTM model
+                from tensorflow.keras.models import Sequential
+                from tensorflow.keras.layers import LSTM, Dense, Dropout
+                
+                model = Sequential([
+                    LSTM(50, return_sequences=True, input_shape=(seq_length, 1)),
+                    Dropout(0.2),
+                    LSTM(50, return_sequences=False),
+                    Dropout(0.2),
+                    Dense(1)
+                ])
+                
+                model.compile(optimizer='adam', loss='mse')
+                sequences = sequences.reshape((sequences.shape[0], sequences.shape[1], 1))
+                model.fit(sequences, targets, epochs=10, batch_size=32, verbose=0)
+                
+                # Make prediction
+                last_sequence = scaled_data[-seq_length:]
+                last_sequence = last_sequence.reshape((1, seq_length, 1))
+                pred = model.predict(last_sequence)
+                prediction = scaler.inverse_transform(pred)[0, 0]
+                
+                # Adjust prediction based on sentiment
+                sentiment_factor = (avg_sentiment - 0.5) * 0.1  # 10% maximum adjustment
+                prediction = prediction * (1 + sentiment_factor)
+                
+            except Exception as e:
+                st.warning(f"Error in transformer model: {str(e)}. Falling back to ensemble model.")
+                model_type = 'ensemble'
         
-        # Make prediction
-        last_price = data['Close'].iloc[-1]
-        prediction = model.predict([[last_price]])[0]
+        if model_type == 'ensemble' or prediction is None:
+            # Create an ensemble of models
+            models = [
+                LinearRegression(),
+                RandomForestRegressor(n_estimators=100),
+                SVR(kernel='rbf')
+            ]
+            
+            predictions = []
+            for model in models:
+                model.fit(X, y)
+                pred = model.predict(X[-1:])
+                predictions.append(pred[0])
+            
+            prediction = np.mean(predictions)
+        
+        elif model_type in ['linear', 'random_forest', 'svr']:
+            # Traditional models
+            if model_type == 'linear':
+                model = LinearRegression()
+            elif model_type == 'random_forest':
+                model = RandomForestRegressor(n_estimators=100)
+            else:  # SVR
+                model = SVR(kernel='rbf')
+            
+            model.fit(X, y)
+            prediction = model.predict(X[-1:])[0]
         
         # Create prediction chart
-        import plotly.graph_objects as go
-        
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data.index, y=data['Close'],
-                               mode='lines',
-                               name='Historical Price'))
         
-        # Add prediction point
-        future_date = data.index[-1] + pd.Timedelta(days=days)
-        fig.add_trace(go.Scatter(x=[data.index[-1], future_date],
-                               y=[last_price, prediction],
-                               mode='lines+markers',
-                               line=dict(dash='dash'),
-                               name='Prediction'))
+        # Historical price
+        fig.add_trace(go.Scatter(
+            x=data.index,
+            y=data['Close'],
+            mode='lines',
+            name='Historical Price',
+            line=dict(color='#00873c', width=2)
+        ))
         
+        # Prediction line
+        future_dates = [data.index[-1] + timedelta(days=i) for i in range(1, days + 1)]
+        current_price = data['Close'].iloc[-1]
+        step = (prediction - current_price) / days
+        predicted_prices = [current_price + (step * i) for i in range(1, days + 1)]
+        
+        fig.add_trace(go.Scatter(
+            x=future_dates,
+            y=predicted_prices,
+            mode='lines',
+            name='Prediction',
+            line=dict(color='#0066cc', width=2, dash='dash')
+        ))
+        
+        # Confidence interval
+        if model_type in ['ensemble', 'transformer']:
+            std = data['Close'].std()
+            upper_bound = [p + std for p in predicted_prices]
+            lower_bound = [p - std for p in predicted_prices]
+            
+            fig.add_trace(go.Scatter(
+                x=future_dates + future_dates[::-1],
+                y=upper_bound + lower_bound[::-1],
+                fill='toself',
+                fillcolor='rgba(0, 102, 204, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='Confidence Interval',
+                showlegend=True
+            ))
+        
+        # Update layout
         fig.update_layout(
-            title='Price Prediction',
+            title=dict(
+                text='Price Prediction with Confidence Interval',
+                x=0.5,
+                xanchor='center',
+                font=dict(size=20, color='white')
+            ),
             yaxis_title='Price (USD)',
-            template='plotly_white'
+            xaxis_title='Date',
+            template='plotly_dark',
+            hovermode='x unified',
+            showlegend=True,
+            legend=dict(
+                yanchor="top",
+                y=0.99,
+                xanchor="left",
+                x=0.01,
+                bgcolor='rgba(0,0,0,0.5)'
+            ),
+            plot_bgcolor='#1a1a1a',
+            paper_bgcolor='#1a1a1a',
+            xaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='rgba(255, 255, 255, 0.1)',
+                showline=True,
+                linewidth=1,
+                linecolor='rgba(255, 255, 255, 0.2)'
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='rgba(255, 255, 255, 0.1)',
+                showline=True,
+                linewidth=1,
+                linecolor='rgba(255, 255, 255, 0.2)'
+            ),
+            margin=dict(l=40, r=40, t=40, b=40)
         )
         
         return prediction, fig
@@ -1111,6 +1271,20 @@ def predict_stock_price(data, days=30, model_type='linear'):
     except Exception as e:
         print_debug(f"Error in price prediction: {str(e)}")
         return None, None
+
+def calculate_rsi(prices, period=14):
+    """Calculate Relative Strength Index"""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(prices, fast=12, slow=26):
+    """Calculate MACD (Moving Average Convergence Divergence)"""
+    exp1 = prices.ewm(span=fast, adjust=False).mean()
+    exp2 = prices.ewm(span=slow, adjust=False).mean()
+    return exp1 - exp2
 
 def get_market_data(stock):
     """Get market data and calculate valuation metrics"""
@@ -1504,59 +1678,229 @@ def main():
     # Custom CSS for better styling
     st.markdown("""
         <style>
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 2px;
-            background-color: #f0f2f6;
-            padding: 10px 10px 0 10px;
-            border-radius: 10px 10px 0 0;
+        /* Global styles */
+        .stApp {
+            background-color: #000000;
+            color: #ffffff;
         }
-        .stTabs [data-baseweb="tab"] {
-            height: 50px;
-            white-space: pre-wrap;
-            background-color: white;
-            border-radius: 5px 5px 0 0;
-            gap: 1px;
-            padding: 10px 20px;
+
+        /* Override all text colors */
+        .stMarkdown, .stMarkdown p, div {
+            color: #ffffff !important;
+        }
+        
+        /* Header Styles */
+        h1 {
+            color: #ffffff !important;
+            font-weight: 600;
+            margin-bottom: 2rem;
+            font-family: "Helvetica Neue", Arial, sans-serif;
+        }
+        
+        h2, h3 {
+            color: #ffffff !important;
             font-weight: 500;
+            margin: 1.5rem 0 1rem 0;
+            font-family: "Helvetica Neue", Arial, sans-serif;
         }
-        .stTabs [aria-selected="true"] {
-            background-color: #4CAF50;
-            color: white;
-        }
-        div[data-testid="stMetricValue"] {
-            font-size: 24px;
-        }
-        div[data-testid="stMetricDelta"] {
-            font-size: 16px;
-        }
-        .recommendation {
+
+        /* Overview section specific */
+        .overview-section {
+            background-color: #1a1a1a;
             padding: 20px;
             border-radius: 10px;
             margin: 20px 0;
+            color: #ffffff !important;
         }
+
+        .overview-section p {
+            color: #ffffff !important;
+            line-height: 1.6;
+            font-size: 16px;
+        }
+
+        /* Company Overview styling */
+        div[data-testid="stExpander"] {
+            background-color: #1a1a1a !important;
+            border: 1px solid #333333 !important;
+            border-radius: 4px !important;
+            margin: 10px 0 !important;
+        }
+
+        .element-container, .stMarkdown {
+            color: #ffffff !important;
+        }
+
+        /* Tab Styling */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 2px;
+            background-color: #1a1a1a;
+            padding: 12px 12px 0 12px;
+            border-radius: 4px 4px 0 0;
+            border-bottom: 1px solid #333333;
+        }
+        
+        .stTabs [data-baseweb="tab"] {
+            height: 50px;
+            white-space: pre-wrap;
+            background-color: #1a1a1a;
+            border-radius: 4px 4px 0 0;
+            gap: 1px;
+            padding: 10px 24px;
+            font-weight: 500;
+            border: 1px solid #333333;
+            border-bottom: none;
+            color: #cccccc;
+            transition: all 0.2s ease;
+        }
+        
+        .stTabs [aria-selected="true"] {
+            background-color: #232323 !important;
+            color: #ffffff !important;
+            border-color: #333333 !important;
+            border-bottom: 2px solid #00873c !important;
+        }
+
+        /* Metric Styling */
+        div[data-testid="stMetricValue"] {
+            font-size: 28px;
+            font-weight: 600;
+            color: #ffffff !important;
+            font-family: "Helvetica Neue", Arial, sans-serif;
+        }
+        
+        div[data-testid="stMetricDelta"] {
+            font-size: 16px;
+            font-weight: 500;
+            color: #cccccc !important;
+        }
+        
+        div[data-testid="stMetricLabel"] {
+            font-size: 14px;
+            color: #999999 !important;
+            font-weight: 500;
+        }
+
+        /* Card Styling */
+        .card {
+            background-color: #1a1a1a;
+            border-radius: 4px;
+            padding: 24px;
+            border: 1px solid #333333;
+            margin: 1rem 0;
+            color: #ffffff !important;
+        }
+
+        /* Recommendation Styles */
+        .recommendation {
+            padding: 24px;
+            border-radius: 4px;
+            margin: 24px 0;
+            background-color: #1a1a1a;
+            border: 1px solid #333333;
+            color: #ffffff !important;
+        }
+        
+        .recommendation h2 {
+            color: #ffffff !important;
+        }
+        
+        .recommendation p, .recommendation li {
+            color: #cccccc !important;
+        }
+        
         .recommendation.success {
-            background-color: #E8F5E9;
-            border: 1px solid #4CAF50;
+            border-left: 4px solid #00873c;
         }
+        
         .recommendation.warning {
-            background-color: #FFF3E0;
-            border: 1px solid #FF9800;
+            border-left: 4px solid #ff8800;
         }
+        
         .recommendation.danger {
-            background-color: #FFEBEE;
-            border: 1px solid #F44336;
+            border-left: 4px solid #ff4444;
         }
+
+        /* Message Styles */
         .error-message {
-            padding: 1rem;
-            background-color: #ffebee;
-            border-left: 5px solid #f44336;
-            margin: 1rem 0;
+            padding: 16px;
+            background-color: #1a1a1a;
+            border-left: 4px solid #ff4444;
+            margin: 16px 0;
+            color: #ffffff !important;
         }
+        
         .info-message {
-            padding: 1rem;
-            background-color: #e3f2fd;
-            border-left: 5px solid #2196f3;
-            margin: 1rem 0;
+            padding: 16px;
+            background-color: #1a1a1a;
+            border-left: 4px solid #0066cc;
+            margin: 16px 0;
+            color: #ffffff !important;
+        }
+
+        /* Input Styling */
+        .stTextInput > div > div {
+            background-color: #1a1a1a !important;
+            border: 1px solid #333333 !important;
+            color: #ffffff !important;
+        }
+        
+        .stTextInput > div > div:focus-within {
+            border-color: #00873c;
+            box-shadow: 0 0 0 1px #00873c;
+        }
+
+        /* Chart Styling */
+        .js-plotly-plot {
+            background-color: #1a1a1a !important;
+            border-radius: 4px;
+            border: 1px solid #333333;
+            padding: 16px;
+        }
+
+        .js-plotly-plot .bg {
+            fill: #1a1a1a !important;
+        }
+
+        /* Table Styling */
+        .dataframe {
+            border-collapse: collapse;
+            width: 100%;
+            border: 1px solid #333333;
+            background-color: #1a1a1a;
+            color: #ffffff !important;
+        }
+        
+        .dataframe th {
+            background-color: #232323;
+            padding: 12px 16px;
+            text-align: left;
+            font-weight: 500;
+            color: #ffffff !important;
+            border-bottom: 1px solid #333333;
+        }
+        
+        .dataframe td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #333333;
+            color: #cccccc !important;
+        }
+        
+        .dataframe tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .dataframe tr:hover {
+            background-color: #232323;
+        }
+
+        /* Fix any remaining text colors */
+        .stMarkdown p {
+            color: #ffffff !important;
+        }
+
+        .element-container div {
+            color: #ffffff !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -1609,9 +1953,26 @@ def main():
                 
                 # Company Summary
                 st.markdown("""
-                    <div style='background-color: #f8f9fa; padding: 20px; border-radius: 10px; margin: 20px 0;'>
-                        <h3 style='margin-bottom: 15px;'>Company Overview</h3>
-                        <p style='font-size: 16px; line-height: 1.6;'>
+                    <div style='
+                        background-color: #1a1a1a; 
+                        padding: 24px; 
+                        border-radius: 4px; 
+                        margin: 24px 0;
+                        border: 1px solid #333333;
+                    '>
+                        <h3 style='
+                            color: #ffffff; 
+                            margin-bottom: 16px;
+                            font-weight: 500;
+                            font-family: "Helvetica Neue", Arial, sans-serif;
+                        '>Company Overview</h3>
+                        <p style='
+                            color: #cccccc; 
+                            font-size: 16px; 
+                            line-height: 1.6;
+                            margin: 0;
+                            font-family: "Helvetica Neue", Arial, sans-serif;
+                        '>
                 """ + get_company_summary(company_info) + """
                         </p>
                     </div>
@@ -1758,7 +2119,7 @@ def main():
                 with col1:
                     days = st.number_input("Prediction Days:", min_value=1, max_value=365, value=30)
                 with col2:
-                    model_type = st.selectbox("Model:", ['linear', 'random_forest', 'svr'])
+                    model_type = st.selectbox("Model:", ['transformer', 'ensemble', 'linear', 'random_forest', 'svr'])
                 
                 if st.button("Predict"):
                     with st.spinner("Calculating prediction..."):

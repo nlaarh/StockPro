@@ -15,6 +15,7 @@ import requests
 import lightgbm as lgb
 from transformers import pipeline
 import ollama
+import time
 
 # Set page config at the very beginning
 st.set_page_config(
@@ -47,26 +48,188 @@ def calculate_bollinger_bands(prices, period=20, std=2):
     return upper_bb, lower_bb
 
 def plot_daily_candlestick(ticker):
-    """Plot daily candlestick chart"""
-    stock = yf.Ticker(ticker)
-    hist_data = stock.history(period='1y')
-    fig = go.Figure(data=[go.Candlestick(
-        x=hist_data.index,
-        open=hist_data['Open'],
-        high=hist_data['High'],
-        low=hist_data['Low'],
-        close=hist_data['Close'],
-        name=ticker
-    )])
-    fig.update_layout(
-        title=f'{ticker} Daily Candlestick Chart',
-        xaxis_title='Date',
-        yaxis_title='Price (USD)',
-        hovermode='x unified',
-        showlegend=True,
-        height=600
-    )
-    return fig
+    try:
+        # Get stock data with alternative method
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365)
+        
+        stock = yf.Ticker(ticker)
+        hist = stock.history(start=start_date, end=end_date, interval='1d')
+        
+        if hist.empty:
+            # Try alternative method with period
+            hist = stock.history(period="1y", interval="1d", proxy=None)
+            
+        if hist.empty:
+            st.error(f"No data available for {ticker}")
+            return
+        
+        # Ensure we have the required columns
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in hist.columns for col in required_columns):
+            st.error(f"Missing required price data for {ticker}")
+            return
+            
+        # Create candlestick chart
+        fig = go.Figure()
+        
+        # Add candlestick trace
+        fig.add_trace(go.Candlestick(
+            x=hist.index,
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name=ticker,
+            showlegend=True
+        ))
+        
+        # Add volume bars
+        colors = ['red' if close < open else 'green' 
+                 for close, open in zip(hist['Close'], hist['Open'])]
+        
+        fig.add_trace(go.Bar(
+            x=hist.index,
+            y=hist['Volume'],
+            name='Volume',
+            yaxis='y2',
+            marker_color=colors,
+            opacity=0.3
+        ))
+        
+        # Update layout
+        fig.update_layout(
+            title=dict(
+                text=f"{ticker} Daily Price Chart",
+                x=0.5,
+                xanchor='center'
+            ),
+            yaxis=dict(
+                title="Price ($)",
+                side="left",
+                showgrid=True
+            ),
+            yaxis2=dict(
+                title="Volume",
+                side="right",
+                overlaying="y",
+                showgrid=False
+            ),
+            xaxis=dict(
+                title="Date",
+                rangeslider=dict(visible=False)
+            ),
+            height=600,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            margin=dict(l=50, r=50, t=85, b=50)
+        )
+        
+        # Update hover template
+        fig.update_traces(
+            xhoverformat="%Y-%m-%d",
+            yhoverformat="$.2f"
+        )
+        
+        # Display the chart
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Get company info and financials
+        info = stock.info
+        
+        # Create tabs for different metric categories
+        metric_tabs = st.tabs(["Key Statistics", "Financial Ratios", "Growth & Margins", "Trading Info"])
+        
+        with metric_tabs[0]:
+            # Key Statistics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Market Cap", f"${info.get('marketCap', 0)/1e9:.2f}B")
+                st.metric("Revenue (TTM)", f"${info.get('totalRevenue', 0)/1e9:.2f}B")
+                st.metric("Net Income (TTM)", f"${info.get('netIncomeToCommon', 0)/1e9:.2f}B")
+            
+            with col2:
+                st.metric("EPS (TTM)", f"${info.get('trailingEps', 0):.2f}")
+                st.metric("Forward EPS", f"${info.get('forwardEps', 0):.2f}")
+                st.metric("Book Value/Share", f"${info.get('bookValue', 0):.2f}")
+            
+            with col3:
+                st.metric("Shares Outstanding", f"{info.get('sharesOutstanding', 0)/1e6:.1f}M")
+                st.metric("Float", f"{info.get('floatShares', 0)/1e6:.1f}M")
+                st.metric("Insider Ownership", f"{info.get('heldPercentInsiders', 0)*100:.1f}%")
+        
+        with metric_tabs[1]:
+            # Financial Ratios
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("P/E (TTM)", f"{info.get('trailingPE', 0):.2f}")
+                st.metric("Forward P/E", f"{info.get('forwardPE', 0):.2f}")
+                st.metric("PEG Ratio", f"{info.get('pegRatio', 0):.2f}")
+            
+            with col2:
+                st.metric("Price/Book", f"{info.get('priceToBook', 0):.2f}")
+                st.metric("Price/Sales", f"{info.get('priceToSalesTrailing12Months', 0):.2f}")
+                st.metric("Enterprise Value/EBITDA", f"{info.get('enterpriseToEbitda', 0):.2f}")
+            
+            with col3:
+                st.metric("Quick Ratio", f"{info.get('quickRatio', 0):.2f}")
+                st.metric("Current Ratio", f"{info.get('currentRatio', 0):.2f}")
+                st.metric("Debt/Equity", f"{info.get('debtToEquity', 0):.2f}")
+        
+        with metric_tabs[2]:
+            # Growth & Margins
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Revenue Growth (YoY)", f"{info.get('revenueGrowth', 0)*100:.1f}%")
+                st.metric("Earnings Growth (YoY)", f"{info.get('earningsGrowth', 0)*100:.1f}%")
+                st.metric("EPS Growth (YoY)", f"{info.get('earningsQuarterlyGrowth', 0)*100:.1f}%")
+            
+            with col2:
+                st.metric("Gross Margin", f"{info.get('grossMargins', 0)*100:.1f}%")
+                st.metric("Operating Margin", f"{info.get('operatingMargins', 0)*100:.1f}%")
+                st.metric("Profit Margin", f"{info.get('profitMargins', 0)*100:.1f}%")
+            
+            with col3:
+                st.metric("ROE", f"{info.get('returnOnEquity', 0)*100:.1f}%")
+                st.metric("ROA", f"{info.get('returnOnAssets', 0)*100:.1f}%")
+                st.metric("ROIC", f"{info.get('returnOnCapital', 0)*100:.1f}%")
+        
+        with metric_tabs[3]:
+            # Trading Information
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("52 Week High", f"${info.get('fiftyTwoWeekHigh', 0):.2f}")
+                st.metric("52 Week Low", f"${info.get('fiftyTwoWeekLow', 0):.2f}")
+                st.metric("50-Day MA", f"${info.get('fiftyDayAverage', 0):.2f}")
+            
+            with col2:
+                st.metric("Beta", f"{info.get('beta', 0):.2f}")
+                st.metric("Average Volume", f"{info.get('averageVolume', 0)/1e6:.1f}M")
+                st.metric("Relative Volume", f"{info.get('averageVolume10days', 0)/info.get('averageVolume', 1):.2f}")
+            
+            with col3:
+                dividend_yield = info.get('dividendYield', 0)
+                if dividend_yield:
+                    dividend_yield = dividend_yield * 100
+                st.metric("Dividend Yield", f"{dividend_yield:.2f}%")
+                st.metric("Ex-Dividend Date", info.get('exDividendDate', 'N/A'))
+                st.metric("Short % of Float", f"{info.get('shortPercentOfFloat', 0)*100:.1f}%")
+        
+        # Add company description in an expander
+        with st.expander("Company Description"):
+            st.write(info.get('longBusinessSummary', 'No description available.'))
+            
+    except Exception as e:
+        st.error(f"Error plotting candlestick chart: {str(e)}")
 
 def plot_technical_analysis(data, ticker, indicators):
     """Plot technical analysis chart"""
@@ -841,6 +1004,7 @@ def generate_prediction_summary(ticker, data, model_type, prediction_days, predi
         """
         
         return summary
+        
     except Exception as e:
         print(f"Error generating summary: {str(e)}")
         return None
@@ -885,38 +1049,117 @@ def calculate_buffett_metrics(ticker):
         market_cap = current_price * shares_outstanding
         
         # Calculate intrinsic value using multiple methods
-        # 1. DCF with 10% growth rate and 15% discount rate
+        # 1. DCF with conservative growth rate and higher discount rate for safety
         future_cash_flows = []
-        growth_rate = 0.10
-        discount_rate = 0.15
+        growth_rate = min(0.20, max(0.08, (net_income / equity) if equity != 0 else 0.10))
+        discount_rate = 0.10  # Standard discount rate
         initial_cash_flow = operating_cash_flow
         
+        # Project cash flows for 10 years
         for i in range(10):
             future_cash_flow = initial_cash_flow * (1 + growth_rate) ** i
             discounted_cf = future_cash_flow / (1 + discount_rate) ** i
             future_cash_flows.append(discounted_cf)
         
-        dcf_value = sum(future_cash_flows) / shares_outstanding
+        # Terminal value calculation with perpetual growth
+        terminal_growth = 0.03  # 3% perpetual growth
+        terminal_value = (future_cash_flows[-1] * (1 + terminal_growth)) / (discount_rate - terminal_growth)
+        discounted_terminal_value = terminal_value / (1 + discount_rate) ** 10
         
-        # 2. Graham Number
+        # Add terminal value to cash flows
+        total_dcf = sum(future_cash_flows) + discounted_terminal_value
+        dcf_value = total_dcf / shares_outstanding
+        
+        # 2. Graham Number with adjusted multiplier based on growth and quality
         eps = info.get('trailingEps', 0)
         book_value_per_share = equity / shares_outstanding
-        graham_value = (22.5 * eps * book_value_per_share) ** 0.5
         
-        # 3. Owner Earnings (Buffett's preferred metric)
+        # Adjust Graham multiplier based on growth and profitability
+        base_multiplier = 22.5  # Graham's base multiplier
+        growth_adjustment = min(7.5, growth_rate * 25)  # Up to 7.5 additional points for growth
+        quality_adjustment = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for high ROE
+        
+        graham_multiplier = base_multiplier + growth_adjustment + quality_adjustment
+        graham_value = (graham_multiplier * eps * book_value_per_share) ** 0.5
+        
+        # 3. Owner Earnings with dynamic multiple
         capex = abs(cash_flow.loc['Capital Expenditure', cash_flow.columns[0]])
-        owner_earnings = operating_cash_flow - capex
-        owner_earnings_value = owner_earnings * 15 / shares_outstanding  # 15x multiple
+        maintenance_capex = capex * 0.7  # Assume 70% of capex is maintenance
+        owner_earnings = operating_cash_flow - maintenance_capex
         
-        # Calculate average intrinsic value
-        intrinsic_values = [dcf_value, graham_value, owner_earnings_value]
-        avg_intrinsic_value = sum(v for v in intrinsic_values if v > 0) / len([v for v in intrinsic_values if v > 0])
+        # Calculate appropriate earnings multiple based on growth and quality
+        base_multiple = 15
+        growth_premium = min(10, growth_rate * 50)  # Up to 10 points for growth
+        quality_premium = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for quality
+        
+        earnings_multiple = base_multiple + growth_premium + quality_premium
+        owner_earnings_value = (owner_earnings / shares_outstanding) * earnings_multiple
+        
+        # Calculate weighted average intrinsic value with dynamic weights
+        weights = {
+            'dcf': 0.4,
+            'graham': 0.3,
+            'owner_earnings': 0.3
+        }
+        
+        # Validate and adjust values
+        valid_values = []
+        valid_weights = []
+        
+        # Only include values that are positive and within reasonable range
+        current_price = info.get('currentPrice', 0)
+        price_range = (current_price * 0.3, current_price * 3.0)  # Reasonable range: 30% to 300% of current price
+        
+        if dcf_value > price_range[0] and dcf_value < price_range[1]:
+            valid_values.append(dcf_value)
+            valid_weights.append(weights['dcf'])
+        
+        if graham_value > price_range[0] and graham_value < price_range[1]:
+            valid_values.append(graham_value)
+            valid_weights.append(weights['graham'])
+        
+        if owner_earnings_value > price_range[0] and owner_earnings_value < price_range[1]:
+            valid_values.append(owner_earnings_value)
+            valid_weights.append(weights['owner_earnings'])
+        
+        # If no valid values, use alternative calculation
+        if not valid_values:
+            # Use PE-based valuation as fallback
+            forward_pe = info.get('forwardPE', 15)
+            industry_pe = info.get('industryPE', 20)
+            target_pe = min(max(forward_pe, industry_pe * 0.8), industry_pe * 1.2)
+            avg_intrinsic_value = eps * target_pe
+        else:
+            # Normalize weights and calculate weighted average
+            weight_sum = sum(valid_weights)
+            valid_weights = [w/weight_sum for w in valid_weights]
+            avg_intrinsic_value = sum(v * w for v, w in zip(valid_values, valid_weights))
+        
+        # Ensure intrinsic value is not too far from current price
+        avg_intrinsic_value = max(min(avg_intrinsic_value, current_price * 3), current_price * 0.4)
+        
+        # Calculate entry points with dynamic margin of safety
+        base_margin = 0.20  # Base margin of safety (20%)
+        
+        # Adjust margin based on:
+        # 1. Company quality (ROE)
+        quality_factor = max(0, min(0.05, (0.15 - roe)))  # Reduce margin for high ROE
+        
+        # 2. Market volatility (beta)
+        beta = info.get('beta', 1.0)
+        volatility_factor = max(0, min(0.05, (beta - 1) * 0.05))  # Increase margin for high beta
+        
+        # 3. Financial strength (debt/equity)
+        strength_factor = max(0, min(0.05, (debt_equity - 1) * 0.05))  # Increase margin for high debt
+        
+        # Combine factors
+        adjusted_margin = base_margin + quality_factor + volatility_factor + strength_factor
         
         # Calculate entry points
-        margin_of_safety = 0.25  # 25% margin of safety
-        strong_buy = avg_intrinsic_value * (1 - margin_of_safety)
-        buy = avg_intrinsic_value * (1 - margin_of_safety/2)
+        strong_buy = avg_intrinsic_value * (1 - adjusted_margin)
+        buy = avg_intrinsic_value * (1 - adjusted_margin/2)
         hold = avg_intrinsic_value
+        sell = avg_intrinsic_value * (1 + adjusted_margin/3)
         
         # Compile metrics
         metrics = {
@@ -1399,12 +1642,12 @@ def prediction_tab():
                     
                     # Add confidence bands if available
                     if confidence_bands is not None:
-                        lower_band, upper_band = confidence_bands
+                        lower_bound, upper_bound = confidence_bands
                         
                         # Plot confidence bands
                         fig.add_trace(go.Scatter(
                             x=date_labels,
-                            y=upper_band,
+                            y=upper_bound,
                             name='Upper Band',
                             line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
                             showlegend=False
@@ -1412,7 +1655,7 @@ def prediction_tab():
                         
                         fig.add_trace(go.Scatter(
                             x=date_labels,
-                            y=lower_band,
+                            y=lower_bound,
                             name='Lower Band',
                             line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
                             fill='tonexty',

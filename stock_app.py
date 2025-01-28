@@ -33,11 +33,14 @@ def calculate_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def calculate_macd(prices, fast=12, slow=26):
-    """Calculate MACD"""
+def calculate_macd(prices, slow=26, fast=12, signal=9):
+    """Calculate MACD for given prices"""
     exp1 = prices.ewm(span=fast, adjust=False).mean()
     exp2 = prices.ewm(span=slow, adjust=False).mean()
-    return exp1 - exp2
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
 
 def calculate_bollinger_bands(prices, period=20, std=2):
     """Calculate Bollinger Bands"""
@@ -279,8 +282,7 @@ def plot_technical_analysis(data, ticker, indicators):
             macd_fast = data.attrs['macd_fast']
             macd_slow = data.attrs['macd_slow']
             macd_signal = data.attrs['macd_signal']
-            macd = calculate_macd(data['Close'], fast=macd_fast, slow=macd_slow)
-            signal = macd.ewm(span=macd_signal, adjust=False).mean()
+            macd, signal, hist = calculate_macd(data['Close'], fast=macd_fast, slow=macd_slow, signal=macd_signal)
             fig.add_trace(go.Scatter(
                 x=data.index,
                 y=macd,
@@ -839,7 +841,7 @@ def generate_prediction_summary(ticker, data, model_type, prediction_days, predi
         # Volume analysis
         avg_volume = data['Volume'].mean()
         recent_volume = data['Volume'].iloc[-1]
-        volume_ratio = (recent_volume / avg_volume - 1) * 100
+        volume_ratio = ((recent_volume - avg_volume) / avg_volume) * 100
         
         # Generate summary
         summary = f"""
@@ -865,8 +867,8 @@ def generate_prediction_summary(ticker, data, model_type, prediction_days, predi
         
         #### 📊 Technical Analysis:
         - RSI ({rsi:.1f}): {'Overbought' if rsi > 70 else 'Oversold' if rsi < 30 else 'Neutral'}
-        - MACD ({macd:.2f}): {'Bullish' if macd > 0 else 'Bearish'}
-        - Moving Averages: {'Bullish' if ma20 > ma50 else 'Bearish'} (MA20 vs MA50)
+        - MACD ({macd:.2f}): {'Bullish' if macd > 0 else 'Bearish' if macd < 0 else 'Neutral'}
+        - Moving Averages: {'Bullish' if current_price > ma20 > ma50 else 'Bearish' if current_price < ma20 < ma50 else 'Mixed'}
         - Volume: {'Above' if volume_ratio > 0 else 'Below'} average by {abs(volume_ratio):.1f}%
         
         #### 💰 Fundamental Analysis:
@@ -1009,291 +1011,156 @@ def generate_prediction_summary(ticker, data, model_type, prediction_days, predi
         print(f"Error generating summary: {str(e)}")
         return None
 
-def calculate_buffett_metrics(ticker):
-    """Calculate Warren Buffett style investment metrics"""
+def generate_analyst_summary(data, ticker, model_type, predictions, confidence_bands):
+    """Generate a detailed analyst summary of the stock prediction"""
     try:
+        # Get current and predicted prices
+        current_price = data['Close'].iloc[-1]
+        predicted_price = predictions[-1]
+        price_change = ((predicted_price - current_price) / current_price) * 100
+        
+        # Calculate key metrics
+        rsi = data['RSI'].iloc[-1]
+        macd = data['MACD'].iloc[-1]
+        signal = data['Signal'].iloc[-1]
+        ma20 = data['MA20'].iloc[-1]
+        ma50 = data['MA50'].iloc[-1]
+        volume = data['Volume'].iloc[-1]
+        avg_volume = data['Volume'].mean()
+        
+        # Get stock info
         stock = yf.Ticker(ticker)
         info = stock.info
+        sector = info.get('sector', 'Unknown Sector')
+        industry = info.get('industry', 'Unknown Industry')
+        market_cap = info.get('marketCap', 0)
+        pe_ratio = info.get('forwardPE', 0)
+        dividend_yield = info.get('dividendYield', 0)
+        if dividend_yield:
+            dividend_yield = dividend_yield * 100
+        beta = info.get('beta', 'N/A')
         
-        # Get financial statements
-        balance_sheet = stock.balance_sheet
-        income_stmt = stock.income_stmt
-        cash_flow = stock.cashflow
-        
-        if balance_sheet.empty or income_stmt.empty or cash_flow.empty:
-            st.warning(f"Unable to perform complete Buffett analysis for {ticker}. Some financial statements are missing.")
-            return None
+        # Format volume numbers
+        def format_large_number(number):
+            """Format large numbers with appropriate suffixes (K, M, B, T)"""
+            if number is None:
+                return "N/A"
             
-        # Current financials - use the first column (most recent)
-        total_assets = balance_sheet.loc['Total Assets', balance_sheet.columns[0]]
-        total_liabilities = balance_sheet.loc['Total Liabilities Net Minority Interest', balance_sheet.columns[0]]
-        equity = total_assets - total_liabilities
-        
-        net_income = income_stmt.loc['Net Income', income_stmt.columns[0]]
-        revenue = income_stmt.loc['Total Revenue', income_stmt.columns[0]]
-        operating_cash_flow = cash_flow.loc['Operating Cash Flow', cash_flow.columns[0]]
-        
-        # Calculate ratios
-        roe = net_income / equity if equity != 0 else 0
-        profit_margin = net_income / revenue if revenue != 0 else 0
-        debt_equity = total_liabilities / equity if equity != 0 else float('inf')
-        
-        # Get current price and shares outstanding
-        current_price = info.get('currentPrice', 0)
-        shares_outstanding = info.get('sharesOutstanding', 0)
-        
-        if current_price == 0 or shares_outstanding == 0:
-            st.warning(f"Missing price or shares data for {ticker}")
-            return None
+            suffixes = ['', 'K', 'M', 'B', 'T']
+            magnitude = 0
             
-        market_cap = current_price * shares_outstanding
-        
-        # Calculate intrinsic value using multiple methods
-        # 1. DCF with conservative growth rate and higher discount rate for safety
-        future_cash_flows = []
-        growth_rate = min(0.20, max(0.08, (net_income / equity) if equity != 0 else 0.10))
-        discount_rate = 0.10  # Standard discount rate
-        initial_cash_flow = operating_cash_flow
-        
-        # Project cash flows for 10 years
-        for i in range(10):
-            future_cash_flow = initial_cash_flow * (1 + growth_rate) ** i
-            discounted_cf = future_cash_flow / (1 + discount_rate) ** i
-            future_cash_flows.append(discounted_cf)
-        
-        # Terminal value calculation with perpetual growth
-        terminal_growth = 0.03  # 3% perpetual growth
-        terminal_value = (future_cash_flows[-1] * (1 + terminal_growth)) / (discount_rate - terminal_growth)
-        discounted_terminal_value = terminal_value / (1 + discount_rate) ** 10
-        
-        # Add terminal value to cash flows
-        total_dcf = sum(future_cash_flows) + discounted_terminal_value
-        dcf_value = total_dcf / shares_outstanding
-        
-        # 2. Graham Number with adjusted multiplier based on growth and quality
-        eps = info.get('trailingEps', 0)
-        book_value_per_share = equity / shares_outstanding
-        
-        # Adjust Graham multiplier based on growth and profitability
-        base_multiplier = 22.5  # Graham's base multiplier
-        growth_adjustment = min(7.5, growth_rate * 25)  # Up to 7.5 additional points for growth
-        quality_adjustment = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for high ROE
-        
-        graham_multiplier = base_multiplier + growth_adjustment + quality_adjustment
-        graham_value = (graham_multiplier * eps * book_value_per_share) ** 0.5
-        
-        # 3. Owner Earnings with dynamic multiple
-        capex = abs(cash_flow.loc['Capital Expenditure', cash_flow.columns[0]])
-        maintenance_capex = capex * 0.7  # Assume 70% of capex is maintenance
-        owner_earnings = operating_cash_flow - maintenance_capex
-        
-        # Calculate appropriate earnings multiple based on growth and quality
-        base_multiple = 15
-        growth_premium = min(10, growth_rate * 50)  # Up to 10 points for growth
-        quality_premium = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for quality
-        
-        earnings_multiple = base_multiple + growth_premium + quality_premium
-        owner_earnings_value = (owner_earnings / shares_outstanding) * earnings_multiple
-        
-        # Calculate weighted average intrinsic value with dynamic weights
-        weights = {
-            'dcf': 0.4,
-            'graham': 0.3,
-            'owner_earnings': 0.3
-        }
-        
-        # Validate and adjust values
-        valid_values = []
-        valid_weights = []
-        
-        # Only include values that are positive and within reasonable range
-        current_price = info.get('currentPrice', 0)
-        price_range = (current_price * 0.3, current_price * 3.0)  # Reasonable range: 30% to 300% of current price
-        
-        if dcf_value > price_range[0] and dcf_value < price_range[1]:
-            valid_values.append(dcf_value)
-            valid_weights.append(weights['dcf'])
-        
-        if graham_value > price_range[0] and graham_value < price_range[1]:
-            valid_values.append(graham_value)
-            valid_weights.append(weights['graham'])
-        
-        if owner_earnings_value > price_range[0] and owner_earnings_value < price_range[1]:
-            valid_values.append(owner_earnings_value)
-            valid_weights.append(weights['owner_earnings'])
-        
-        # If no valid values, use alternative calculation
-        if not valid_values:
-            # Use PE-based valuation as fallback
-            forward_pe = info.get('forwardPE', 15)
-            industry_pe = info.get('industryPE', 20)
-            target_pe = min(max(forward_pe, industry_pe * 0.8), industry_pe * 1.2)
-            avg_intrinsic_value = eps * target_pe
-        else:
-            # Normalize weights and calculate weighted average
-            weight_sum = sum(valid_weights)
-            valid_weights = [w/weight_sum for w in valid_weights]
-            avg_intrinsic_value = sum(v * w for v, w in zip(valid_values, valid_weights))
-        
-        # Ensure intrinsic value is not too far from current price
-        avg_intrinsic_value = max(min(avg_intrinsic_value, current_price * 3), current_price * 0.4)
-        
-        # Calculate entry points with dynamic margin of safety
-        base_margin = 0.20  # Base margin of safety (20%)
-        
-        # Adjust margin based on:
-        # 1. Company quality (ROE)
-        quality_factor = max(0, min(0.05, (0.15 - roe)))  # Reduce margin for high ROE
-        
-        # 2. Market volatility (beta)
-        beta = info.get('beta', 1.0)
-        volatility_factor = max(0, min(0.05, (beta - 1) * 0.05))  # Increase margin for high beta
-        
-        # 3. Financial strength (debt/equity)
-        strength_factor = max(0, min(0.05, (debt_equity - 1) * 0.05))  # Increase margin for high debt
-        
-        # Combine factors
-        adjusted_margin = base_margin + quality_factor + volatility_factor + strength_factor
-        
-        # Calculate entry points
-        strong_buy = avg_intrinsic_value * (1 - adjusted_margin)
-        buy = avg_intrinsic_value * (1 - adjusted_margin/2)
-        hold = avg_intrinsic_value
-        sell = avg_intrinsic_value * (1 + adjusted_margin/3)
-        
-        # Compile metrics
-        metrics = {
-            'Business Understanding': {
-                'Industry': info.get('industry', 'N/A'),
-                'Sector': info.get('sector', 'N/A'),
-                'Business Model': info.get('longBusinessSummary', 'N/A')
-            },
-            'Competitive Advantage': {
-                'Market Position': info.get('marketPosition', 'N/A'),
-                'Brand Value': info.get('brandValue', 'N/A'),
-                'Economic Moat': 'Wide' if profit_margin > 0.2 else 'Narrow' if profit_margin > 0.1 else 'None'
-            },
-            'Management Quality': {
-                'Return on Equity': f"{roe*100:.1f}%",
-                'Profit Margin': f"{profit_margin*100:.1f}%",
-                'Operating Efficiency': 'Good' if profit_margin > 0.15 else 'Fair' if profit_margin > 0.08 else 'Poor'
-            },
-            'Financial Health': {
-                'Debt/Equity': f"{debt_equity:.2f}x",
-                'Operating Cash Flow': f"${operating_cash_flow/1e9:.1f}B",
-                'Net Income': f"${net_income/1e9:.1f}B"
-            },
-            'Value Metrics': {
-                'Market Cap': f"${market_cap/1e9:.1f}B",
-                'P/E Ratio': info.get('forwardPE', 0),
-                'Book Value': f"${book_value_per_share:.2f}/share"
-            },
-            'Entry Price Analysis': {
-                'Current Price': current_price,
-                'Target Price': avg_intrinsic_value,
-                'Entry Points': {
-                    'Strong Buy Below': strong_buy,
-                    'Buy Below': buy,
-                    'Hold Above': hold
-                },
-                'Valuation Methods': {
-                    'DCF Value': dcf_value,
-                    'Graham Number': graham_value,
-                    'Owner Earnings Value': owner_earnings_value
-                }
-            }
-        }
-        
-        return metrics
-        
-    except Exception as e:
-        st.error(f"Error calculating Buffett metrics: {str(e)}")
-        return None
+            while abs(number) >= 1000 and magnitude < len(suffixes)-1:
+                magnitude += 1
+                number /= 1000.0
+            
+            if magnitude > 0:
+                return f"${number:,.2f}{suffixes[magnitude]}"
+            else:
+                return f"${number:,.2f}"
 
-def get_buffett_recommendation(metrics):
-    """Generate investment recommendation based on Buffett metrics"""
-    try:
-        if not metrics or not isinstance(metrics, dict):
-            return "HOLD", "yellow", ["Insufficient data to make a recommendation"]
+        formatted_volume = format_large_number(volume)
+        formatted_avg_volume = format_large_number(avg_volume)
+        formatted_market_cap = format_large_number(market_cap)
+        
+        # Determine trend strength
+        trend = "UPWARD" if price_change > 0 else "DOWNWARD"
+        strength = "STRONG" if abs(price_change) > 5 else "MODERATE" if abs(price_change) > 2 else "MILD"
+        
+        # Analyze confidence bands
+        lower_bound = confidence_bands[0][-1]
+        upper_bound = confidence_bands[1][-1]
+        band_spread = ((upper_bound - lower_bound) / current_price) * 100
+        
+        # Moving average analysis
+        ma_status = 'strong support' if current_price > ma20 > ma50 else 'significant resistance' if current_price < ma20 < ma50 else 'mixed signals'
+        ma_text = f"with the 20-day MA at ${ma20:,.2f} and the 50-day MA at ${ma50:,.2f}"
+        
+        # Format moving averages text
+        ma_description = (
+            f"while the moving average configuration shows "
+            f"{'strong support' if current_price > ma20 > ma50 else 'significant resistance' if current_price < ma20 < ma50 else 'mixed signals'} "
+            f"with the 20-day MA at ${ma20:,.2f} and the 50-day MA at ${ma50:,.2f}"
+        )
+
+        # Market analysis parts
+        analysis_parts = [
+            f"**Market Overview:** Based on our comprehensive analysis of **{ticker}**, operating in the *{sector} sector*,",
+            f"our *{model_type}* model projects a **{strength.lower()} {trend.lower()} movement** with a target price of **${predicted_price:,.2f}**,",
+            f"representing a **{price_change:+,.2f}%** change from the current price of **${current_price:,.2f}**.",
             
-        entry_analysis = metrics.get('Entry Price Analysis', {})
-        if not entry_analysis:
-            return "HOLD", "yellow", ["Unable to analyze entry prices"]
+            f"\n\n**Technical Analysis:** The indicators present a {'compelling' if abs(price_change) > 5 else 'moderate'} case for this projection,",
+            f"with the **RSI** at **{rsi:,.1f}** indicating *{'overbought conditions that may limit upside' if rsi > 70 else 'oversold conditions that may provide buying opportunities' if rsi < 30 else 'neutral momentum'}*.",
+            f"The **MACD** indicator *{'confirms this trend' if (price_change > 0 and macd > signal) or (price_change < 0 and macd < signal) else 'shows potential trend weakness'}*,",
+            ma_description + ".",
             
-        current_price = entry_analysis.get('Current Price', 0)
-        target_price = entry_analysis.get('Target Price', 0)
-        entry_points = entry_analysis.get('Entry Points', {})
+            f"\n\n**Volume Analysis:** Trading volume *{'supports this outlook' if volume > avg_volume else 'suggests caution'}*,",
+            f"with current volume at **{formatted_volume}** {'above' if volume > avg_volume else 'below'} the average of **{formatted_avg_volume}**,",
+            f"indicating **{'strong' if volume > avg_volume else 'weak'}** market participation.",
+            
+            f"\n\n**Risk Metrics:** The stock's beta of **{beta if isinstance(beta, str) else f'{beta:,.2f}'}** and P/E ratio of **{pe_ratio if isinstance(pe_ratio, str) else f'{pe_ratio:,.2f}'}**",
+            f"*{'suggest higher volatility' if isinstance(beta, (int, float)) and beta > 1 else 'indicate relative stability'}*,",
+            f"while the {f'dividend yield of **{dividend_yield:,.2f}%** provides additional return potential' if dividend_yield else 'absence of dividends focuses returns on price appreciation'}.",
+            
+            f"\n\n**Trading Strategy:** Given the confidence band spread of **{band_spread:,.1f}%**, we recommend",
+            f"**{'aggressive' if band_spread < 5 and volume > avg_volume else 'moderate' if band_spread < 10 else 'conservative'}** position sizing",
+            f"with clear stop-loss levels at **${min(lower_bound, ma20):,.2f}**.",
+            f"Market conditions and sector trends *{'support' if price_change > 0 and volume > avg_volume else 'challenge'}* this outlook,",
+            f"suggesting a **{'favorable' if price_change > 0 and volume > avg_volume else 'cautious'}** approach to position management."
+        ]
         
-        if not current_price or not target_price or not entry_points:
-            return "HOLD", "yellow", ["Missing price analysis data"]
+        # Join parts with proper spacing
+        market_analysis = " ".join(analysis_parts)
         
-        strong_buy = entry_points.get('Strong Buy Below', float('inf'))
-        buy = entry_points.get('Buy Below', float('inf'))
-        hold = entry_points.get('Hold Above', 0)
-        
-        # Initialize recommendation components
-        recommendation = "HOLD"
-        color = "yellow"
-        reasons = []
-        
-        # Calculate price metrics
-        upside = ((target_price - current_price) / current_price) * 100
-        
-        # Add price-based reasons
-        if current_price <= strong_buy:
-            recommendation = "STRONG BUY"
-            color = "green"
-            reasons.append(f"Price (${current_price:.2f}) is below strong buy level (${strong_buy:.2f})")
-            reasons.append(f"Significant upside potential of {upside:.1f}%")
-        elif current_price <= buy:
-            recommendation = "BUY"
-            color = "blue"
-            reasons.append(f"Price (${current_price:.2f}) is at an attractive entry point")
-            reasons.append(f"Potential upside of {upside:.1f}%")
-        elif current_price <= hold:
-            recommendation = "HOLD"
-            color = "yellow"
-            reasons.append(f"Price (${current_price:.2f}) is near fair value")
-            reasons.append(f"Limited upside of {upside:.1f}%")
+        # Generate summary sections
+        summary = f"""
+### 📊 Stock Analysis Report for {ticker}
+
+#### Detailed Market Analysis
+{market_analysis}
+
+#### Company Overview
+- **Sector**: {sector}
+- **Industry**: {industry}
+- **Market Cap**: {formatted_market_cap}
+- **Beta**: {beta if isinstance(beta, str) else f'{beta:,.2f}'}
+- **P/E Ratio**: {pe_ratio if isinstance(pe_ratio, str) else f'{pe_ratio:,.2f}'}
+- **Dividend Yield**: {f'{dividend_yield:,.2f}%' if dividend_yield else 'N/A'}
+
+#### Price Analysis
+- **Current Price**: ${current_price:,.2f}
+- **Predicted Price**: ${predicted_price:,.2f} ({price_change:+,.2f}%)
+- **Confidence Range**: ${lower_bound:,.2f} to ${upper_bound:,.2f} ({band_spread:,.1f}% spread)
+- **Model Used**: {model_type}
+
+#### Technical Indicators
+- **RSI (14)**: {rsi:,.1f} ({'Overbought' if rsi > 70 else 'Oversold' if rsi < 30 else 'Neutral'})
+- **MACD Signal**: {'Bullish' if macd > signal else 'Bearish' if macd < signal else 'Neutral'}
+- **Moving Averages**: {'Bullish' if current_price > ma20 > ma50 else 'Bearish' if current_price < ma20 < ma50 else 'Mixed'}
+- **Volume**: {formatted_volume} ({'Above' if volume > avg_volume else 'Below'} Average)
+
+#### Trading Considerations
+"""
+        # Add trading considerations based on analysis
+        if trend == "UPWARD":
+            summary += f"""
+- **Entry Strategy**: Look for pullbacks near ${lower_bound:,.2f} (lower band) or ${ma20:,.2f} (20-day MA)
+- **Target Price**: Primary target at ${predicted_price:,.2f}, extended target at ${upper_bound:,.2f}
+- **Stop Loss**: Place protective stops below ${min(lower_bound, ma20):,.2f}
+- **Position Sizing**: {'Consider larger positions due to strong volume' if volume > avg_volume else 'Start with smaller positions and scale in'}
+- **Risk Management**: {'Volume confirms trend strength' if volume > avg_volume else 'Lower volume suggests caution'}"""
         else:
-            recommendation = "REDUCE"
-            color = "red"
-            reasons.append(f"Price (${current_price:.2f}) is above fair value")
-            reasons.append("Consider taking profits or reducing position")
+            summary += f"""
+- **Risk Management**: Consider reducing exposure or implementing hedges
+- **Support Levels**: Watch for support at ${lower_bound:,.2f} and ${ma50:,.2f}
+- **Position Sizing**: {'Reduce position size due to high volatility' if band_spread > 10 else 'Standard position sizing acceptable'}
+- **Alternative Strategy**: Consider waiting for price stabilization near ${lower_bound:,.2f}
+- **Hedging**: Consider protective puts or stop orders at ${min(lower_bound, ma20):,.2f}"""
         
-        # Add fundamental reasons
-        if metrics.get('Financial Health'):
-            health = metrics['Financial Health']
-            if health.get('Strong Balance Sheet'):
-                reasons.append("Strong balance sheet")
-            if health.get('Good Cash Flow'):
-                reasons.append("Healthy cash flow generation")
-            if health.get('Low Debt'):
-                reasons.append("Conservative debt levels")
-                
-        if metrics.get('Competitive Advantage'):
-            moat = metrics['Competitive Advantage']
-            if moat.get('Strong Moat'):
-                reasons.append("Strong competitive advantages")
-            if moat.get('Market Leader'):
-                reasons.append("Market leadership position")
-                
-        if metrics.get('Management Quality'):
-            mgmt = metrics['Management Quality']
-            if mgmt.get('Good Track Record'):
-                reasons.append("Proven management track record")
-            if mgmt.get('Shareholder Friendly'):
-                reasons.append("Shareholder-friendly management")
-        
-        # Ensure we have at least one reason
-        if not reasons:
-            reasons.append("Basic valuation metrics suggest this recommendation")
-            
-        return recommendation, color, reasons
+        return summary
         
     except Exception as e:
-        print(f"Error in get_buffett_recommendation: {str(e)}")
-        return "HOLD", "yellow", ["Error in analysis, defaulting to HOLD recommendation"]
+        print(f"Error generating analyst summary: {str(e)}")
+        return None
 
 def technical_analysis_tab():
     try:
@@ -1478,21 +1345,22 @@ def technical_analysis_tab():
         st.error(f"Detailed error: {traceback.format_exc()}")
 
 def prediction_tab():
+    """Stock price prediction tab with analyst insights"""
     try:
         st.header("Stock Price Prediction")
         
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="prediction_ticker").upper()
+            ticker = st.text_input("Enter Stock Symbol:", "AAPL").upper()
             prediction_days = st.slider("Prediction Days", 1, 30, 7)
             
             model_type = st.selectbox(
                 "Select Model",
-                ["Random Forest", "XGBoost", "LightGBM", "Ensemble", "LLM", "Ollama 3.2"]
+                ["Random Forest", "XGBoost", "LightGBM", "Ensemble", "Ollama 3.2"]
             )
             
-            if model_type in ["LLM", "Ollama 3.2"]:
+            if model_type == "Ollama 3.2":
                 # Test Ollama connection
                 ollama_running, error = test_ollama_connection()
                 if not ollama_running:
@@ -1509,125 +1377,64 @@ def prediction_tab():
                     """)
                     return
         
-        if st.button("Predict"):
+        if st.button("Generate Prediction"):
             try:
-                with st.spinner("Loading stock data..."):
+                with st.spinner("Loading data and generating prediction..."):
                     # Get stock data
                     stock = yf.Ticker(ticker)
-                    hist = stock.history(period="1y")
+                    data = stock.history(period="1y")
                     
-                    if hist.empty:
+                    if data.empty:
                         st.error(f"No data found for {ticker}")
                         return
-                
-                with st.spinner("Calculating technical indicators..."):
+                    
                     # Calculate technical indicators
-                    hist['MA20'] = hist['Close'].rolling(window=20).mean()
-                    hist['MA50'] = hist['Close'].rolling(window=50).mean()
+                    data['MA20'] = data['Close'].rolling(window=20).mean()
+                    data['MA50'] = data['Close'].rolling(window=50).mean()
+                    data['RSI'] = calculate_rsi(data['Close'])
                     
-                    # RSI
-                    delta = hist['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                    rs = gain / loss
-                    hist['RSI'] = 100 - (100 / (1 + rs))
-                    
-                    # MACD
-                    exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
-                    exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
-                    hist['MACD'] = exp1 - exp2
-                    
-                    # Bollinger Bands
-                    hist['BB_Middle'] = hist['Close'].rolling(window=20).mean()
-                    hist['BB_Upper'] = hist['BB_Middle'] + 2 * hist['Close'].rolling(window=20).std()
-                    hist['BB_Lower'] = hist['BB_Middle'] - 2 * hist['Close'].rolling(window=20).std()
+                    # Calculate MACD with error handling
+                    try:
+                        macd_line, signal_line, histogram = calculate_macd(data['Close'])
+                        data['MACD'] = macd_line
+                        data['Signal'] = signal_line
+                        data['MACD_Hist'] = histogram
+                    except Exception as e:
+                        st.warning(f"Error calculating MACD: {str(e)}. Using default values.")
+                        data['MACD'] = data['Close'].rolling(window=12).mean() - data['Close'].rolling(window=26).mean()
+                        data['Signal'] = data['MACD'].rolling(window=9).mean()
+                        data['MACD_Hist'] = data['MACD'] - data['Signal']
                     
                     # Drop NaN values
-                    hist = hist.dropna()
-                
-                with st.spinner("Making predictions..."):
-                    # Get selected features
-                    feature_sets = {
-                        "Basic": ["Open", "High", "Low", "Volume"],
-                        "Technical": ["Open", "High", "Low", "Volume", "MA20", "MA50", "RSI", "MACD"],
-                        "Advanced": ["Open", "High", "Low", "Volume", "MA20", "MA50", "RSI", "MACD", "BB_Upper", "BB_Lower"]
-                    }
-                    features = feature_sets["Advanced"]  # Use advanced features for better predictions
+                    data = data.dropna()
                     
-                    # Verify data preparation
-                    data_ok, data_error = test_data_preparation(hist, features, 'Close')
-                    if not data_ok:
-                        st.error(f"Data preparation error: {data_error}")
-                        return
+                    # Prepare features
+                    features = ['Open', 'High', 'Low', 'Volume', 'MA20', 'MA50', 'RSI', 'MACD']
                     
                     # Make prediction
-                    result = predict_stock_price(hist, model_type, features, 'Close', prediction_days)
+                    result = predict_stock_price(data, model_type, features, 'Close', prediction_days)
                     
                     if result is None or not isinstance(result, tuple) or len(result) != 3:
-                        st.error("""
-                        Failed to generate prediction. This could be due to:
-                        1. Insufficient historical data
-                        2. Invalid feature values
-                        3. Model training failure
-                        
-                        Please try:
-                        1. A different stock ticker
-                        2. A different prediction model
-                        3. Reducing the prediction days
-                        """)
+                        st.error("Failed to generate prediction. Please try a different stock or model.")
                         return
                     
-                    # Safely unpack the result
                     predictions, y_test, confidence_bands = result
                     
-                    # Additional validation
-                    if predictions is None or y_test is None or confidence_bands is None:
-                        st.error("Invalid prediction results")
-                        return
-                        
-                    if len(predictions) == 0 or len(y_test) == 0:
-                        st.error("Empty prediction results")
-                        return
-                        
-                    if not isinstance(confidence_bands, tuple) or len(confidence_bands) != 2:
-                        st.error("Invalid confidence bands")
-                        return
-                
-                with st.spinner("Generating analysis..."):
-                    # Generate and display summary
-                    summary = generate_prediction_summary(
-                        ticker, 
-                        hist, 
-                        model_type, 
-                        prediction_days, 
-                        predictions,
-                        confidence_bands
-                    )
-                    
-                    if summary:
-                        st.markdown(summary)
-                    else:
-                        st.warning("Could not generate prediction summary")
-                
-                with st.spinner("Creating visualization..."):
-                    # Display prediction plot
-                    # Generate dates for x-axis
-                    last_date = hist.index[-1]
+                    # Create visualization
+                    last_date = data.index[-1]
                     future_dates = [last_date + timedelta(days=x) for x in range(prediction_days)]
-                    date_labels = [d.strftime('%m/%d/%Y') for d in future_dates]
+                    date_labels = [d.strftime('%Y-%m-%d') for d in future_dates]
                     
-                    # Create figure
                     fig = go.Figure()
                     
-                    # Plot historical data (last 30 days)
+                    # Plot historical data
                     historical_days = 30
-                    recent_hist = hist.tail(historical_days)
-                    hist_dates = recent_hist.index
-                    hist_date_labels = [d.strftime('%m/%d/%Y') for d in hist_dates]
+                    recent_data = data.tail(historical_days)
+                    hist_dates = [d.strftime('%Y-%m-%d') for d in recent_data.index]
                     
                     fig.add_trace(go.Scatter(
-                        x=hist_date_labels,
-                        y=recent_hist['Close'],
+                        x=hist_dates,
+                        y=recent_data['Close'],
                         name='Historical',
                         line=dict(color='blue')
                     ))
@@ -1640,69 +1447,47 @@ def prediction_tab():
                         line=dict(color='red', dash='dash')
                     ))
                     
-                    # Add confidence bands if available
-                    if confidence_bands is not None:
-                        lower_bound, upper_bound = confidence_bands
-                        
-                        # Plot confidence bands
-                        fig.add_trace(go.Scatter(
-                            x=date_labels,
-                            y=upper_bound,
-                            name='Upper Band',
-                            line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
-                            showlegend=False
-                        ))
-                        
-                        fig.add_trace(go.Scatter(
-                            x=date_labels,
-                            y=lower_bound,
-                            name='Lower Band',
-                            line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
-                            fill='tonexty',
-                            showlegend=False
-                        ))
+                    # Add confidence bands
+                    fig.add_trace(go.Scatter(
+                        x=date_labels,
+                        y=confidence_bands[1],
+                        name='Upper Band',
+                        line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
+                        showlegend=False
+                    ))
                     
-                    # Update layout
+                    fig.add_trace(go.Scatter(
+                        x=date_labels,
+                        y=confidence_bands[0],
+                        name='Lower Band',
+                        line=dict(color='rgba(0,100,80,0.2)', dash='dash'),
+                        fill='tonexty',
+                        showlegend=False
+                    ))
+                    
                     fig.update_layout(
-                        title=f"{ticker} Stock Price Prediction ({last_date.strftime('%m/%d/%Y')} to {future_dates[-1].strftime('%m/%d/%Y')})",
+                        title=f"{ticker} Stock Price Prediction",
                         xaxis_title="Date",
                         yaxis_title="Price ($)",
                         hovermode='x unified',
                         showlegend=True,
-                        xaxis=dict(
-                            type='category',
-                            tickmode='array',
-                            ticktext=hist_date_labels + date_labels,
-                            tickvals=list(range(len(hist_date_labels + date_labels))),
-                            tickangle=45
-                        )
+                        height=500
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # Generate and display prediction summary
-                    summary = generate_prediction_summary(
-                        ticker, hist, model_type, prediction_days,
-                        predictions, confidence_bands
-                    )
+                    # Generate and display analyst summary
+                    with st.expander("📈 View Detailed Analyst Report", expanded=True):
+                        analyst_summary = generate_analyst_summary(
+                            data, ticker, model_type, predictions, confidence_bands
+                        )
+                        if analyst_summary:
+                            st.markdown(analyst_summary)
+                        else:
+                            st.warning("Could not generate analyst summary. Some data may be missing.")
                     
-                    if summary:
-                        st.markdown("### Prediction Analysis")
-                        st.write(summary)
             except Exception as e:
-                st.error(f"""
-                Error during prediction: {str(e)}
-                
-                This might be due to:
-                1. Network connectivity issues
-                2. Invalid stock data
-                3. Computation error
-                
-                Please try:
-                1. Checking your internet connection
-                2. Using a different stock ticker
-                3. Selecting a different model
-                """)
+                st.error(f"Error during prediction: {str(e)}")
                 st.exception(e)
     except Exception as e:
         st.error(f"Error in prediction tab: {str(e)}")
@@ -1828,7 +1613,7 @@ def analyze_stock_recommendation(ticker):
         company_name = info.get('longName', ticker)
         sector = info.get('sector', 'N/A')
         industry = info.get('industry', 'N/A')
-        market_cap = info.get('marketCap', 0) / 1e9  # Convert to billions
+        market_cap = info.get('marketCap', 0)
         pe_ratio = info.get('forwardPE', 0)
         dividend_yield = info.get('dividendYield', 0)
         if dividend_yield:
@@ -1873,7 +1658,7 @@ def analyze_stock_recommendation(ticker):
 ### {company_name} ({ticker})
 - **Sector**: {sector}
 - **Industry**: {industry}
-- **Market Cap**: ${market_cap:.1f}B
+- **Market Cap**: ${market_cap/1e9:.1f}B
 - **Current Price**: ${current_price:.2f}
 - **Recommended Buy Price**: ${buy_price:.2f}
 - **Target Sell Price**: ${sell_price:.2f}
@@ -1968,6 +1753,440 @@ def recommendations_tab():
     except Exception as e:
         st.error(f"Error in recommendations tab: {str(e)}")
 
+def get_market_movers():
+    """Get top gainers and losers from major indices"""
+    try:
+        # Get data for S&P 500 stocks
+        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "WMT",
+                  "PG", "JNJ", "XOM", "BAC", "MA", "UNH", "HD", "CVX", "PFE", "CSCO", "VZ",
+                  "CRM", "ABT", "AVGO", "ACN", "DHR", "ADBE", "NFLX", "TMO", "NKE"]
+        
+        stock_data = []
+        for ticker in tickers:
+            try:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="2d")
+                if len(hist) >= 2:
+                    prev_close = hist['Close'].iloc[-2]
+                    current_close = hist['Close'].iloc[-1]
+                    change_pct = ((current_close - prev_close) / prev_close) * 100
+                    volume = hist['Volume'].iloc[-1]
+                    market_cap = stock.info.get('marketCap', 0)
+                    
+                    stock_data.append({
+                        'Ticker': ticker,
+                        'Name': stock.info.get('shortName', ticker),
+                        'Price': current_close,
+                        'Change %': change_pct,
+                        'Volume': volume,
+                        'Market Cap': market_cap
+                    })
+            except Exception as e:
+                print(f"Error fetching data for {ticker}: {str(e)}")
+                continue
+        
+        # Sort by percentage change
+        stock_data.sort(key=lambda x: x['Change %'])
+        
+        # Get top 5 losers and gainers
+        losers = stock_data[:5]
+        gainers = stock_data[-5:][::-1]
+        
+        # Convert to DataFrames
+        gainers_df = pd.DataFrame(gainers)
+        losers_df = pd.DataFrame(losers)
+        
+        # Format columns
+        for df in [gainers_df, losers_df]:
+            df['Price'] = df['Price'].map('${:,.2f}'.format)
+            df['Change %'] = df['Change %'].map('{:+.2f}%'.format)
+            df['Volume'] = df['Volume'].map('{:,.0f}'.format)
+            df['Market Cap'] = df['Market Cap'].map('${:,.0f}'.format)
+        
+        return gainers_df, losers_df
+    except Exception as e:
+        print(f"Error in get_market_movers: {str(e)}")
+        return pd.DataFrame(), pd.DataFrame()
+
+def market_movers_tab():
+    """Display market movers tab with top gainers and losers"""
+    try:
+        st.header("📊 Market Movers")
+        
+        # Add refresh button
+        if st.button("🔄 Refresh Data"):
+            st.experimental_rerun()
+        
+        # Get market movers data
+        with st.spinner("Fetching market data..."):
+            gainers_df, losers_df = get_market_movers()
+        
+        if not gainers_df.empty and not losers_df.empty:
+            # Create two columns
+            col1, col2 = st.columns(2)
+            
+            # Display gainers
+            with col1:
+                st.subheader("🚀 Top Gainers")
+                st.dataframe(
+                    gainers_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                        "Name": st.column_config.TextColumn("Name", width="medium"),
+                        "Price": st.column_config.TextColumn("Price", width="small"),
+                        "Change %": st.column_config.TextColumn("Change %", width="small"),
+                        "Volume": st.column_config.TextColumn("Volume", width="medium"),
+                        "Market Cap": st.column_config.TextColumn("Market Cap", width="medium")
+                    }
+                )
+            
+            # Display losers
+            with col2:
+                st.subheader("📉 Top Losers")
+                st.dataframe(
+                    losers_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                        "Name": st.column_config.TextColumn("Name", width="medium"),
+                        "Price": st.column_config.TextColumn("Price", width="small"),
+                        "Change %": st.column_config.TextColumn("Change %", width="small"),
+                        "Volume": st.column_config.TextColumn("Volume", width="medium"),
+                        "Market Cap": st.column_config.TextColumn("Market Cap", width="medium")
+                    }
+                )
+            
+            # Add market indices summary
+            st.markdown("---")
+            st.subheader("📈 Market Indices")
+            
+            try:
+                indices = {
+                    "^GSPC": "S&P 500",
+                    "^DJI": "Dow Jones",
+                    "^IXIC": "NASDAQ"
+                }
+                
+                index_data = []
+                for symbol, name in indices.items():
+                    index = yf.Ticker(symbol)
+                    hist = index.history(period="2d")
+                    if len(hist) >= 2:
+                        prev_close = hist['Close'].iloc[-2]
+                        current_close = hist['Close'].iloc[-1]
+                        change_pct = ((current_close - prev_close) / prev_close) * 100
+                        index_data.append({
+                            'Index': name,
+                            'Price': current_close,
+                            'Change %': change_pct
+                        })
+                
+                # Create columns for indices
+                cols = st.columns(len(index_data))
+                for i, data in enumerate(index_data):
+                    with cols[i]:
+                        st.metric(
+                            data['Index'],
+                            f"${data['Price']:,.2f}",
+                            f"{data['Change %']:+.2f}%",
+                            delta_color="normal"
+                        )
+            except Exception as e:
+                st.error(f"Error fetching market indices: {str(e)}")
+        else:
+            st.error("Unable to fetch market movers data. Please try again later.")
+            
+    except Exception as e:
+        st.error(f"Error in market movers tab: {str(e)}")
+
+def calculate_buffett_metrics(ticker):
+    """Calculate Warren Buffett style investment metrics"""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Get financial statements
+        balance_sheet = stock.balance_sheet
+        income_stmt = stock.income_stmt
+        cash_flow = stock.cashflow
+        
+        if balance_sheet.empty or income_stmt.empty or cash_flow.empty:
+            st.warning(f"Unable to perform complete Buffett analysis for {ticker}. Some financial statements are missing.")
+            return None
+            
+        # Current financials - use the first column (most recent)
+        total_assets = balance_sheet.loc['Total Assets', balance_sheet.columns[0]]
+        total_liabilities = balance_sheet.loc['Total Liabilities Net Minority Interest', balance_sheet.columns[0]]
+        equity = total_assets - total_liabilities
+        
+        net_income = income_stmt.loc['Net Income', income_stmt.columns[0]]
+        revenue = income_stmt.loc['Total Revenue', income_stmt.columns[0]]
+        operating_cash_flow = cash_flow.loc['Operating Cash Flow', cash_flow.columns[0]]
+        
+        # Calculate ratios
+        roe = net_income / equity if equity != 0 else 0
+        profit_margin = net_income / revenue if revenue != 0 else 0
+        debt_equity = total_liabilities / equity if equity != 0 else float('inf')
+        
+        # Get current price and shares outstanding
+        current_price = info.get('currentPrice', 0)
+        shares_outstanding = info.get('sharesOutstanding', 0)
+        
+        if current_price == 0 or shares_outstanding == 0:
+            st.warning(f"Missing price or shares data for {ticker}")
+            return None
+            
+        market_cap = current_price * shares_outstanding
+        
+        # Calculate intrinsic value using multiple methods
+        # 1. DCF with conservative growth rate and higher discount rate for safety
+        future_cash_flows = []
+        growth_rate = min(0.20, max(0.08, (net_income / equity) if equity != 0 else 0.10))
+        discount_rate = 0.10  # Standard discount rate
+        initial_cash_flow = operating_cash_flow
+        
+        # Project cash flows for 10 years
+        for i in range(10):
+            future_cash_flow = initial_cash_flow * (1 + growth_rate) ** i
+            discounted_cf = future_cash_flow / (1 + discount_rate) ** i
+            future_cash_flows.append(discounted_cf)
+        
+        # Terminal value calculation with perpetual growth
+        terminal_growth = 0.03  # 3% perpetual growth
+        terminal_value = (future_cash_flows[-1] * (1 + terminal_growth)) / (discount_rate - terminal_growth)
+        discounted_terminal_value = terminal_value / (1 + discount_rate) ** 10
+        
+        # Add terminal value to cash flows
+        total_dcf = sum(future_cash_flows) + discounted_terminal_value
+        dcf_value = total_dcf / shares_outstanding
+        
+        # 2. Graham Number with adjusted multiplier based on growth and quality
+        eps = info.get('trailingEps', 0)
+        book_value_per_share = equity / shares_outstanding
+        
+        # Adjust Graham multiplier based on growth and profitability
+        base_multiplier = 22.5  # Graham's base multiplier
+        growth_adjustment = min(7.5, growth_rate * 25)  # Up to 7.5 additional points for growth
+        quality_adjustment = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for high ROE
+        
+        graham_multiplier = base_multiplier + growth_adjustment + quality_adjustment
+        graham_value = (graham_multiplier * eps * book_value_per_share) ** 0.5
+        
+        # 3. Owner Earnings with dynamic multiple
+        capex = abs(cash_flow.loc['Capital Expenditure', cash_flow.columns[0]])
+        maintenance_capex = capex * 0.7  # Assume 70% of capex is maintenance
+        owner_earnings = operating_cash_flow - maintenance_capex
+        
+        # Calculate appropriate earnings multiple based on growth and quality
+        base_multiple = 15
+        growth_premium = min(10, growth_rate * 50)  # Up to 10 points for growth
+        quality_premium = min(5, (roe * 100 - 15) / 3) if roe > 0.15 else 0  # Up to 5 points for quality
+        
+        earnings_multiple = base_multiple + growth_premium + quality_premium
+        owner_earnings_value = (owner_earnings / shares_outstanding) * earnings_multiple
+        
+        # Calculate weighted average intrinsic value with dynamic weights
+        weights = {
+            'dcf': 0.4,
+            'graham': 0.3,
+            'owner_earnings': 0.3
+        }
+        
+        # Validate and adjust values
+        valid_values = []
+        valid_weights = []
+        
+        # Only include values that are positive and within reasonable range
+        price_range = (current_price * 0.3, current_price * 3.0)  # Reasonable range: 30% to 300% of current price
+        
+        if dcf_value > price_range[0] and dcf_value < price_range[1]:
+            valid_values.append(dcf_value)
+            valid_weights.append(weights['dcf'])
+        
+        if graham_value > price_range[0] and graham_value < price_range[1]:
+            valid_values.append(graham_value)
+            valid_weights.append(weights['graham'])
+        
+        if owner_earnings_value > price_range[0] and owner_earnings_value < price_range[1]:
+            valid_values.append(owner_earnings_value)
+            valid_weights.append(weights['owner_earnings'])
+        
+        # If no valid values, use alternative calculation
+        if not valid_values:
+            # Use PE-based valuation as fallback
+            forward_pe = info.get('forwardPE', 15)
+            industry_pe = info.get('industryPE', 20)
+            target_pe = min(max(forward_pe, industry_pe * 0.8), industry_pe * 1.2)
+            avg_intrinsic_value = eps * target_pe
+        else:
+            # Normalize weights and calculate weighted average
+            weight_sum = sum(valid_weights)
+            valid_weights = [w/weight_sum for w in valid_weights]
+            avg_intrinsic_value = sum(v * w for v, w in zip(valid_values, valid_weights))
+        
+        # Ensure intrinsic value is not too far from current price
+        avg_intrinsic_value = max(min(avg_intrinsic_value, current_price * 3), current_price * 0.4)
+        
+        # Calculate entry points with dynamic margin of safety
+        base_margin = 0.20  # Base margin of safety (20%)
+        
+        # Adjust margin based on:
+        # 1. Company quality (ROE)
+        quality_factor = max(0, min(0.05, (0.15 - roe)))  # Reduce margin for high ROE
+        
+        # 2. Market volatility (beta)
+        beta = info.get('beta', 1.0)
+        volatility_factor = max(0, min(0.05, (beta - 1) * 0.05))  # Increase margin for high beta
+        
+        # 3. Financial strength (debt/equity)
+        strength_factor = max(0, min(0.05, (debt_equity - 1) * 0.05))  # Increase margin for high debt
+        
+        # Combine factors
+        adjusted_margin = base_margin + quality_factor + volatility_factor + strength_factor
+        
+        # Calculate entry points
+        strong_buy = avg_intrinsic_value * (1 - adjusted_margin)
+        buy = avg_intrinsic_value * (1 - adjusted_margin/2)
+        hold = avg_intrinsic_value
+        sell = avg_intrinsic_value * (1 + adjusted_margin/3)
+        
+        # Compile metrics
+        metrics = {
+            'Business Understanding': {
+                'Industry': info.get('industry', 'N/A'),
+                'Sector': info.get('sector', 'N/A'),
+                'Business Model': info.get('longBusinessSummary', 'N/A')
+            },
+            'Competitive Advantage': {
+                'Market Position': info.get('marketPosition', 'N/A'),
+                'Brand Value': info.get('brandValue', 'N/A'),
+                'Economic Moat': 'Wide' if profit_margin > 0.2 else 'Narrow' if profit_margin > 0.1 else 'None'
+            },
+            'Management Quality': {
+                'Return on Equity': f"{roe*100:.1f}%",
+                'Profit Margin': f"{profit_margin*100:.1f}%",
+                'Operating Efficiency': 'Good' if profit_margin > 0.15 else 'Fair' if profit_margin > 0.08 else 'Poor'
+            },
+            'Financial Health': {
+                'Debt/Equity': f"{debt_equity:.2f}x",
+                'Operating Cash Flow': f"${operating_cash_flow/1e9:.1f}B",
+                'Net Income': f"${net_income/1e9:.1f}B"
+            },
+            'Value Metrics': {
+                'Market Cap': f"${market_cap/1e9:.1f}B",
+                'P/E Ratio': info.get('forwardPE', 0),
+                'Book Value': f"${book_value_per_share:.2f}/share"
+            },
+            'Entry Price Analysis': {
+                'Current Price': current_price,
+                'Target Price': avg_intrinsic_value,
+                'Entry Points': {
+                    'Strong Buy Below': strong_buy,
+                    'Buy Below': buy,
+                    'Hold Above': hold
+                },
+                'Valuation Methods': {
+                    'DCF Value': dcf_value,
+                    'Graham Number': graham_value,
+                    'Owner Earnings Value': owner_earnings_value
+                }
+            }
+        }
+        
+        return metrics
+        
+    except Exception as e:
+        st.error(f"Error calculating Buffett metrics: {str(e)}")
+        return None
+
+def get_buffett_recommendation(metrics):
+    """Generate investment recommendation based on Buffett metrics"""
+    try:
+        if not metrics or not isinstance(metrics, dict):
+            return "HOLD", "yellow", ["Insufficient data to make a recommendation"]
+            
+        entry_analysis = metrics.get('Entry Price Analysis', {})
+        if not entry_analysis:
+            return "HOLD", "yellow", ["Unable to analyze entry prices"]
+            
+        current_price = entry_analysis.get('Current Price', 0)
+        target_price = entry_analysis.get('Target Price', 0)
+        entry_points = entry_analysis.get('Entry Points', {})
+        
+        if not current_price or not target_price or not entry_points:
+            return "HOLD", "yellow", ["Missing price analysis data"]
+        
+        strong_buy = entry_points.get('Strong Buy Below', float('inf'))
+        buy = entry_points.get('Buy Below', float('inf'))
+        hold = entry_points.get('Hold Above', 0)
+        
+        # Initialize recommendation components
+        recommendation = "HOLD"
+        color = "yellow"
+        reasons = []
+        
+        # Calculate price metrics
+        upside = ((target_price - current_price) / current_price) * 100
+        
+        # Add price-based reasons
+        if current_price <= strong_buy:
+            recommendation = "STRONG BUY"
+            color = "green"
+            reasons.append(f"Price (${current_price:.2f}) is below strong buy level (${strong_buy:.2f})")
+            reasons.append(f"Significant upside potential of {upside:.1f}%")
+        elif current_price <= buy:
+            recommendation = "BUY"
+            color = "blue"
+            reasons.append(f"Price (${current_price:.2f}) is at an attractive entry point")
+            reasons.append(f"Potential upside of {upside:.1f}%")
+        elif current_price <= hold:
+            recommendation = "HOLD"
+            color = "yellow"
+            reasons.append(f"Price (${current_price:.2f}) is near fair value")
+            reasons.append(f"Limited upside of {upside:.1f}%")
+        else:
+            recommendation = "REDUCE"
+            color = "red"
+            reasons.append(f"Price (${current_price:.2f}) is above fair value")
+            reasons.append("Consider taking profits or reducing position")
+        
+        # Add fundamental reasons
+        if metrics.get('Financial Health'):
+            health = metrics['Financial Health']
+            if 'Strong Balance Sheet' in health:
+                reasons.append("Strong balance sheet")
+            if 'Good Cash Flow' in health:
+                reasons.append("Healthy cash flow generation")
+            if 'Low Debt' in health:
+                reasons.append("Conservative debt levels")
+                
+        if metrics.get('Competitive Advantage'):
+            moat = metrics['Competitive Advantage']
+            if 'Strong Moat' in moat:
+                reasons.append("Strong competitive advantages")
+            if 'Market Leader' in moat:
+                reasons.append("Market leadership position")
+                
+        if metrics.get('Management Quality'):
+            mgmt = metrics['Management Quality']
+            if 'Good Track Record' in mgmt:
+                reasons.append("Proven management track record")
+            if 'Shareholder Friendly' in mgmt:
+                reasons.append("Shareholder-friendly management")
+        
+        # Ensure we have at least one reason
+        if not reasons:
+            reasons.append("Basic valuation metrics suggest this recommendation")
+            
+        return recommendation, color, reasons
+        
+    except Exception as e:
+        print(f"Error in get_buffett_recommendation: {str(e)}")
+        return "HOLD", "yellow", ["Error in analysis, defaulting to HOLD recommendation"]
+
 def main():
     st.title("Stock Analysis App")
     
@@ -1977,7 +2196,7 @@ def main():
     if ticker:
         try:
             # Create tabs for different charts
-            tab_names = ["Daily Chart", "Technical Analysis", "Historical", "Price Prediction", "Buffett Analysis", "Stock Recommendations"]
+            tab_names = ["Daily Chart", "Technical Analysis", "Historical", "Price Prediction", "Buffett Analysis", "Stock Recommendations", "Market Movers"]
             chart_tabs = st.tabs(tab_names)
             
             # Daily Chart Tab
@@ -2109,6 +2328,10 @@ def main():
             # Stock Recommendations Tab
             with chart_tabs[5]:
                 recommendations_tab()
+                
+            # Market Movers Tab
+            with chart_tabs[6]:
+                market_movers_tab()
         
         except Exception as e:
             st.error(f"Error: {str(e)}")

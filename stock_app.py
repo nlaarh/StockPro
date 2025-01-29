@@ -237,7 +237,9 @@ def prediction_tab():
         st.header("🔮 Stock Price Prediction")
         
         # Get user input
-        ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="prediction_ticker").upper()
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="prediction_ticker").upper()
         
         # Model selection
         model_type = st.selectbox(
@@ -271,300 +273,189 @@ def prediction_tab():
         if st.button("Generate Prediction", key="generate_prediction"):
             with st.spinner("Fetching data and generating prediction..."):
                 try:
-                    # Get stock data
-                    data = get_stock_data(ticker)
+                    # Get stock data safely
+                    stock = yf.Ticker(ticker)
+                    info = stock.info
+                    
+                    # Safely get current price and create initial metrics
+                    current_price = float(info.get('currentPrice', 0))
+                    if current_price == 0:
+                        hist = stock.history(period="1d")
+                        if not hist.empty:
+                            current_price = float(hist['Close'].iloc[-1])
+                    
+                    # Get historical data for technical analysis
+                    data = stock.history(period="1y")
                     if data.empty:
                         st.error(f"No data found for {ticker}")
                         return
                     
+                    # Process technical indicators
+                    data['MA20'] = data['Close'].rolling(window=20).mean()
+                    data['MA50'] = data['Close'].rolling(window=50).mean()
+                    data['MA200'] = data['Close'].rolling(window=200).mean()
+                    
+                    # Calculate RSI
+                    delta = data['Close'].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    rs = gain / loss
+                    data['RSI'] = 100 - (100 / (1 + rs))
+                    
+                    # Calculate MACD
+                    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+                    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+                    data['MACD'] = exp1 - exp2
+                    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+                    
                     # Test LLM connection if selected
                     if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
-                        is_available, message = test_ollama_connection(model_type)
+                        is_available = test_ollama_connection(model_type)
                         if not is_available:
-                            st.error(message)
-                            st.warning("Falling back to Random Forest model...")
+                            st.warning(f"{model_type} not available. Falling back to Random Forest model...")
                             model_type = "Random Forest"
                     
                     # Generate predictions
-                    predictions = predict_stock_price(
-                        data,
-                        prediction_days,
-                        model_type
-                    )
-                    
-                    if predictions is not None:
-                        # Plot predictions
-                        confidence_bands = calculate_confidence_bands(predictions)
-                        plot_predictions(data, predictions, confidence_bands)
+                    if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
+                        # Use LLM prediction
+                        prediction_data = {
+                            'ticker': ticker,
+                            'current_price': current_price,
+                            'ma20': float(data['MA20'].iloc[-1]),
+                            'ma50': float(data['MA50'].iloc[-1]),
+                            'ma200': float(data['MA200'].iloc[-1]),
+                            'rsi': float(data['RSI'].iloc[-1]),
+                            'volume': float(data['Volume'].iloc[-1]),
+                            'prediction_days': prediction_days
+                        }
                         
-                        # Show prediction summary
-                        with st.expander("Prediction Analysis", expanded=True):
-                            last_price = data['Close'].iloc[-1]
-                            pred_change = ((predictions[-1] - last_price) / last_price) * 100
+                        predictions = predict_stock_price(prediction_data, model_type)
+                        
+                        if predictions:
+                            # Display LLM prediction results
+                            st.subheader("Price Prediction")
                             
-                            # Technical Analysis
-                            st.subheader("Technical Analysis")
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric(
+                                    "Direction",
+                                    predictions.get('direction', 'UNKNOWN'),
+                                    delta="↑" if predictions.get('direction') == "UP" else "↓"
+                                )
+                            
+                            with col2:
+                                change = float(predictions.get('percent_change', 0))
+                                st.metric(
+                                    "Expected Change",
+                                    f"{change:+.2f}%",
+                                    delta=change,
+                                    delta_color="normal"
+                                )
+                            
+                            with col3:
+                                confidence = float(predictions.get('confidence', 0))
+                                st.metric(
+                                    "Confidence",
+                                    f"{confidence:.1f}%"
+                                )
+                            
+                            # Calculate price targets
+                            predicted_change = float(predictions.get('percent_change', 0)) / 100
+                            predicted_price = current_price * (1 + predicted_change)
+                            
+                            # Display price predictions
+                            st.subheader("Price Targets")
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                lower_bound = predicted_price * 0.95
+                                st.metric(
+                                    "Conservative Target",
+                                    f"${lower_bound:.2f}",
+                                    delta=f"{((lower_bound/current_price - 1) * 100):.1f}%",
+                                    delta_color="inverse"
+                                )
+                            
+                            with col2:
+                                st.metric(
+                                    "Base Target",
+                                    f"${predicted_price:.2f}",
+                                    delta=f"{((predicted_price/current_price - 1) * 100):.1f}%",
+                                    delta_color="normal"
+                                )
+                            
+                            with col3:
+                                upper_bound = predicted_price * 1.05
+                                st.metric(
+                                    "Optimistic Target",
+                                    f"${upper_bound:.2f}",
+                                    delta=f"{((upper_bound/current_price - 1) * 100):.1f}%",
+                                    delta_color="normal"
+                                )
+                    else:
+                        # Use traditional ML models
+                        predictions = predict_stock_price(data, prediction_days, model_type)
+                        if predictions is not None:
+                            plot_predictions(data, predictions)
+                            
+                            # Show prediction summary
+                            last_price = data['Close'].iloc[-1]
+                            pred_price = predictions[-1]
+                            price_change = ((pred_price - last_price) / last_price) * 100
+                            
+                            st.subheader("Price Prediction")
                             col1, col2 = st.columns(2)
                             
                             with col1:
-                                st.metric("Current Price", f"${last_price:.2f}")
-                                st.metric("RSI", f"{data['RSI'].iloc[-1]:.1f}")
-                                st.metric("MACD", f"{data['MACD'].iloc[-1]:.2f}")
+                                st.metric(
+                                    "Current Price",
+                                    f"${last_price:.2f}"
+                                )
                             
                             with col2:
-                                st.metric("Predicted Price", f"${predictions[-1]:.2f}", 
-                                        f"{pred_change:+.1f}%")
-                                st.metric("20-day MA", f"${data['MA20'].iloc[-1]:.2f}")
-                                st.metric("50-day MA", f"${data['MA50'].iloc[-1]:.2f}")
-                            
-                            # Confidence Intervals
-                            st.subheader("Prediction Confidence")
-                            st.write(f"""
-                            - Lower Bound: ${confidence_bands[0][-1]:.2f}
-                            - Upper Bound: ${confidence_bands[1][-1]:.2f}
-                            - Confidence Range: ${(confidence_bands[1][-1] - confidence_bands[0][-1]):.2f}
-                            """)
-                            
-                            # Model-specific Analysis
-                            if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
-                                st.subheader("AI Analysis")
-                                analysis = get_llm_analysis(data, ticker, model_type)
-                                if analysis:
-                                    st.markdown(analysis)
-                    else:
-                        st.error("Failed to generate predictions")
-                        
+                                st.metric(
+                                    f"Predicted Price ({prediction_days} days)",
+                                    f"${pred_price:.2f}",
+                                    delta=f"{price_change:+.2f}%",
+                                    delta_color="normal" if price_change > 0 else "inverse"
+                                )
+                    
+                    # Display technical analysis
+                    st.subheader("Technical Indicators")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        ma_signal = "Bullish" if data['MA20'].iloc[-1] > data['MA50'].iloc[-1] else "Bearish"
+                        st.metric(
+                            "Moving Average Signal",
+                            ma_signal,
+                            delta="↑" if ma_signal == "Bullish" else "↓"
+                        )
+                    
+                    with col2:
+                        rsi = data['RSI'].iloc[-1]
+                        rsi_signal = "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral"
+                        st.metric(
+                            "RSI Signal",
+                            f"{rsi:.1f}",
+                            delta=rsi_signal
+                        )
+                    
+                    with col3:
+                        volume_change = ((data['Volume'].iloc[-1] / data['Volume'].iloc[-2]) - 1) * 100
+                        st.metric(
+                            "Volume Change",
+                            f"{volume_change:+.1f}%",
+                            delta="Higher" if volume_change > 0 else "Lower"
+                        )
+                
                 except Exception as e:
-                    st.error(f"Error generating prediction: {str(e)}")
-                    logger.error(traceback.format_exc())
+                    st.error(f"Error in prediction: {str(e)}")
+                    st.info("Please verify the ticker symbol and try again.")
     
     except Exception as e:
         st.error(f"Error in prediction tab: {str(e)}")
-        logger.error(traceback.format_exc())
-
-def calculate_confidence_bands(predictions, confidence=0.01):
-    """Calculate confidence bands around predictions"""
-    try:
-        mean = np.mean(predictions)
-        std = np.std(predictions)
-        
-        # Calculate confidence intervals
-        upper_band = mean + (std * confidence)
-        lower_band = mean - (std * confidence)
-        
-        return mean, upper_band, lower_band
-    except Exception as e:
-        st.error(f"Error calculating confidence bands: {str(e)}")
-        return None, None, None
-
-def predict_stock_price(ticker, model_type="Ollama 3.2"):
-    """Get stock price prediction using LLM analysis"""
-    try:
-        # Test model availability
-        is_available, message = test_ollama_connection(model_type)
-        if not is_available:
-            st.error(message)
-            return None
-            
-        # Get stock data
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1y")
-        current_price = hist['Close'].iloc[-1]
-        
-        # Create prompt for price prediction
-        prompt = f"""You are a stock market expert. Analyze {ticker} and predict:
-        1. Price movement direction (UP/DOWN)
-        2. Percentage change (-10% to +10%)
-        3. Confidence level (0-100%)
-        4. Key factors supporting prediction
-        
-        Current price: ${current_price:.2f}
-        
-        Format response exactly as JSON:
-        {{
-            "direction": "UP or DOWN",
-            "percent_change": float between -10 and 10,
-            "confidence": float between 0 and 100,
-            "factors": ["factor1", "factor2", ...]
-        }}
-        """
-        
-        # Make API call to Ollama
-        try:
-            response = requests.post(
-                'http://localhost:11434/api/generate',
-                json={
-                    'model': 'llama3.2' if model_type == "Ollama 3.2" else "deepseek-coder",
-                    'prompt': prompt,
-                    'stream': False
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()['response']
-                # Parse JSON response
-                try:
-                    prediction = json.loads(result)
-                    return prediction
-                except json.JSONDecodeError:
-                    st.error("Error parsing LLM response")
-                    return None
-                    
-        except Exception as e:
-            st.error(f"Error getting prediction: {str(e)}")
-            return None
-            
-    except Exception as e:
-        st.error(f"Error in stock prediction: {str(e)}")
-        return None
-
-def prediction_tab():
-    """Stock price prediction tab with LLM analysis"""
-    try:
-        st.header("🔮 Price Prediction")
-        
-        # Model selection
-        model_type = st.selectbox(
-            "Select Model",
-            ["Ollama 3.2", "DeepSeek-R1"],
-            key="pred_model"
-        )
-        
-        # Get prediction
-        if st.button("Get Prediction", key="get_pred"):
-            with st.spinner("Analyzing market data..."):
-                prediction = predict_stock_price(ticker, model_type)
-                
-                if prediction:
-                    # Display prediction summary
-                    st.subheader("Price Prediction")
-                    
-                    # Create columns for metrics
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        direction = prediction['direction']
-                        st.metric(
-                            "Direction",
-                            direction,
-                            delta="↑" if direction == "UP" else "↓"
-                        )
-                    
-                    with col2:
-                        change = prediction['percent_change']
-                        st.metric(
-                            "Expected Change",
-                            f"{change:+.2f}%",
-                            delta=change,
-                            delta_color="normal"
-                        )
-                    
-                    with col3:
-                        confidence = prediction['confidence']
-                        st.metric(
-                            "Confidence",
-                            f"{confidence:.1f}%"
-                        )
-                    
-                    # Calculate confidence bands
-                    stock = yf.Ticker(ticker)
-                    current_price = stock.history(period="1d")['Close'].iloc[-1]
-                    predicted_change = prediction['percent_change'] / 100
-                    predicted_price = current_price * (1 + predicted_change)
-                    
-                    # Generate range of predictions
-                    predictions = np.random.normal(
-                        predicted_price,
-                        current_price * 0.01,  # 1% standard deviation
-                        1000
-                    )
-                    
-                    mean, upper, lower = calculate_confidence_bands(predictions)
-                    
-                    # Display price predictions
-                    st.subheader("Price Range Prediction")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric(
-                            "Lower Bound",
-                            f"${lower:.2f}",
-                            delta=f"{((lower/current_price - 1) * 100):.1f}%",
-                            delta_color="inverse"
-                        )
-                    
-                    with col2:
-                        st.metric(
-                            "Target Price",
-                            f"${mean:.2f}",
-                            delta=f"{((mean/current_price - 1) * 100):.1f}%",
-                            delta_color="normal"
-                        )
-                    
-                    with col3:
-                        st.metric(
-                            "Upper Bound",
-                            f"${upper:.2f}",
-                            delta=f"{((upper/current_price - 1) * 100):.1f}%",
-                            delta_color="normal"
-                        )
-                    
-                    # Display supporting factors
-                    st.subheader("Analysis Factors")
-                    for factor in prediction['factors']:
-                        st.write(f"• {factor}")
-                    
-                    # Add prediction chart
-                    fig = go.Figure()
-                    
-                    # Add current price line
-                    fig.add_hline(
-                        y=current_price,
-                        line_dash="dash",
-                        line_color="gray",
-                        annotation_text="Current Price"
-                    )
-                    
-                    # Add prediction range
-                    fig.add_hrect(
-                        y0=lower,
-                        y1=upper,
-                        fillcolor="lightblue",
-                        opacity=0.2,
-                        line_width=0
-                    )
-                    
-                    # Add target price line
-                    fig.add_hline(
-                        y=mean,
-                        line_color="blue",
-                        annotation_text="Target Price"
-                    )
-                    
-                    fig.update_layout(
-                        title="Price Prediction Range",
-                        yaxis_title="Price ($)",
-                        showlegend=False,
-                        height=400
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Add explanation
-                    with st.expander("About Price Predictions"):
-                        st.write("""
-                        This prediction is based on:
-                        1. **Technical Analysis**: Price patterns and indicators
-                        2. **Market Sentiment**: News and social media analysis
-                        3. **Historical Data**: Past price movements and volatility
-                        4. **Confidence Bands**: Represent potential price range
-                        
-                        Note: All predictions are estimates and should not be the sole basis for investment decisions.
-                        """)
-                        
-    except Exception as e:
-        st.error(f"Error in prediction tab: {str(e)}")
+        st.info("Please refresh the page and try again.")
 
 def get_stock_data(ticker):
     """Get stock data with technical indicators"""
@@ -829,7 +720,14 @@ def get_buffett_analysis(ticker, financials, info):
         def safe_get(data, key, default=0):
             try:
                 value = data.get(key, default)
-                return float(value[0]) if isinstance(value, list) else float(value)
+                if isinstance(value, pd.Series):
+                    return float(value.iloc[0])
+                elif isinstance(value, list):
+                    return float(value[0])
+                elif isinstance(value, (int, float)):
+                    return float(value)
+                else:
+                    return default
             except (TypeError, ValueError, IndexError):
                 return default
 
@@ -861,11 +759,23 @@ def get_buffett_analysis(ticker, financials, info):
         gross_margin = safe_get(info, 'grossMargins', 0) * 100
         
         # Calculate FCF and yield
-        fcf = safe_get(financials, 'Free Cash Flow')
+        try:
+            fcf = financials.get('Free Cash Flow', pd.Series([0])).iloc[0]
+        except:
+            fcf = 0
         fcf_yield = safe_divide(fcf, market_cap) * 100 if market_cap > 0 else 0
         
-        # Calculate intrinsic value using simple DCF with safety checks
-        growth_rate = max(min(safe_get(info, 'revenueGrowth', 0.05), 0.15), 0)  # Cap between 0% and 15%
+        # Calculate growth rates
+        try:
+            revenue_growth = safe_get(info, 'revenueGrowth', 0.05)
+            if isinstance(revenue_growth, (int, float)):
+                growth_rate = max(min(revenue_growth, 0.15), 0)  # Cap between 0% and 15%
+            else:
+                growth_rate = 0.05  # Default to 5% if growth rate is invalid
+        except:
+            growth_rate = 0.05
+            
+        # Valuation calculations
         discount_rate = 0.10  # 10% discount rate
         years = 10
         
@@ -878,27 +788,29 @@ def get_buffett_analysis(ticker, financials, info):
             # Fallback to a simple earnings-based valuation
             intrinsic_value = (net_income * 15) / shares_outstanding if shares_outstanding > 0 else current_price
         
-        # Calculate margin of safety with check for positive intrinsic value
+        # Calculate margin of safety
         margin_of_safety = safe_divide((intrinsic_value - current_price), intrinsic_value) * 100 if intrinsic_value > 0 else -100
         
         # Get company info with defaults
         sector = info.get('sector', 'Unknown')
         industry = info.get('industry', 'Unknown')
         business_summary = info.get('longBusinessSummary', 'No business summary available.')
-
+        
         # Collect metrics for write-up
         metrics = {
-            'operating_margin': float(operating_margin),
-            'roe': float(roe),
-            'gross_margin': float(gross_margin),
-            'current_ratio': float(current_ratio),
-            'debt_to_equity': float(debt_to_equity),
-            'fcf_yield': float(fcf_yield),
-            'pe_ratio': float(pe_ratio),
-            'margin_of_safety': float(margin_of_safety),
-            'current_price': float(current_price),
-            'market_cap': float(market_cap),
-            'profit_margin': float(profit_margin)
+            'market_cap': market_cap,
+            'operating_margin': operating_margin,
+            'roe': roe,
+            'gross_margin': gross_margin,
+            'current_ratio': current_ratio,
+            'debt_to_equity': debt_to_equity,
+            'fcf_yield': fcf_yield,
+            'pe_ratio': pe_ratio,
+            'margin_of_safety': margin_of_safety,
+            'current_price': current_price,
+            'profit_margin': profit_margin,
+            'revenue_growth': growth_rate * 100,  # Convert to percentage
+            'profit_growth': safe_get(info, 'netIncomeGrowth', 0) * 100  # Convert to percentage
         }
         
         # Generate the analysis
@@ -915,14 +827,14 @@ _{business_summary[:300]}..._
    |--------|--------|---------|------------|
    | Return on Equity (ROE) | {roe:.1f}% | Measures how efficiently company uses shareholder money | {'Excellent' if roe > 15 else 'Good' if roe > 12 else 'Fair' if roe > 10 else 'Poor'} |
    | Operating Margin | {operating_margin:.1f}% | Indicates pricing power and operational efficiency | {'Excellent' if operating_margin > 25 else 'Good' if operating_margin > 15 else 'Fair' if operating_margin > 10 else 'Poor'} |
-   | Gross Margin | {gross_margin:.1f}% | Shows pricing power and brand strength | {'Strong' if gross_margin > 40 else 'Good' if gross_margin > 30 else 'Fair' if gross_margin > 20 else 'Weak'} |
+   | Gross Margin | {gross_margin:.1f}% | Shows pricing power and brand strength | {'Excellent' if gross_margin > 40 else 'Good' if gross_margin > 30 else 'Fair' if gross_margin > 20 else 'Poor'} |
    | Profit Margin | {profit_margin:.1f}% | Net profit per dollar of revenue | {'Excellent' if profit_margin > 20 else 'Good' if profit_margin > 15 else 'Fair' if profit_margin > 10 else 'Poor'} |
 
 2. **Financial Health**
    | Metric | Value | Meaning | Assessment |
    |--------|--------|---------|------------|
-   | Debt/Equity | {debt_to_equity:.1f} | Measures financial leverage | {'Conservative' if debt_to_equity < 50 else 'Moderate' if debt_to_equity < 100 else 'High'} |
-   | Current Ratio | {current_ratio:.1f} | Shows ability to pay short-term obligations | {'Strong' if current_ratio > 2 else 'Adequate' if current_ratio > 1.5 else 'Weak'} |
+   | Debt/Equity | {debt_to_equity:.1f}% | Measures financial leverage | {'Conservative' if debt_to_equity < 50 else 'Moderate' if debt_to_equity < 100 else 'High'} |
+   | Current Ratio | {current_ratio:.2f} | Shows ability to pay short-term obligations | {'Excellent' if current_ratio > 2 else 'Good' if current_ratio > 1.5 else 'Fair' if current_ratio > 1 else 'Poor'} |
    | FCF Yield | {fcf_yield:.1f}% | Indicates cash generation relative to price | {'Excellent' if fcf_yield > 8 else 'Good' if fcf_yield > 5 else 'Fair' if fcf_yield > 3 else 'Poor'} |
 
 3. **Growth and Value**
@@ -937,556 +849,460 @@ _{business_summary[:300]}..._
 - Estimated Intrinsic Value: ${intrinsic_value:.2f}
 - Margin of Safety: {margin_of_safety:.1f}%
 
-#### 💡 Investment Recommendation
+#### 🎯 Investment Recommendation
 """
-        # Generate recommendation and detailed analysis
-        if roe > 15 and debt_to_equity < 50 and margin_of_safety > 30:
-            analysis += f"""
-**Strong Buy** 📈
+        # Add technical analysis
+        try:
+            hist_data = yf.Ticker(ticker).history(period='1y')
+            if not hist_data.empty:
+                # Calculate technical signals
+                sma_50 = hist_data['Close'].rolling(window=50).mean().iloc[-1]
+                sma_200 = hist_data['Close'].rolling(window=200).mean().iloc[-1]
+                rsi = calculate_rsi(hist_data['Close'])[-1]
+                macd, signal, _ = calculate_macd(hist_data['Close'])
+                
+                technical_signal = "Bullish" if sma_50 > sma_200 and rsi < 70 and macd[-1] > signal[-1] else \
+                                 "Bearish" if sma_50 < sma_200 and rsi > 30 and macd[-1] < signal[-1] else "Neutral"
+                
+                analysis += f"""
+#### 📊 Technical Analysis
+- **50-Day MA**: ${sma_50:.2f}
+- **200-Day MA**: ${sma_200:.2f}
+- **RSI**: {rsi:.1f}
+- **Technical Outlook**: {technical_signal}
+"""
+        except Exception as e:
+            logger.warning(f"Could not generate technical analysis: {str(e)}")
+            
+        # Add risk assessment
+        analysis += f"""
+#### ⚠️ Risk Assessment
+1. **Market Risk**
+   - Beta: {safe_get(info, 'beta', 1.0):.2f}
+   - Market Cap Stability: {'High' if market_cap > 10e9 else 'Moderate' if market_cap > 2e9 else 'Low'}
 
-{ticker} presents a compelling investment opportunity with strong fundamentals and significant upside potential:
+2. **Financial Risk**
+   - Debt Level: {'High' if debt_to_equity > 100 else 'Moderate' if debt_to_equity > 50 else 'Low'}
+   - Liquidity Risk: {'Low' if current_ratio > 2 else 'Moderate' if current_ratio > 1.5 else 'High'}
 
-1. **Superior Profitability**
-   - Industry-leading ROE of {roe:.1f}%, indicating excellent capital allocation
-   - Strong operating margins at {operating_margin:.1f}%, suggesting pricing power
-   - Healthy gross margins of {gross_margin:.1f}%, reflecting brand strength
+3. **Business Risk**
+   - Revenue Concentration: {'Diversified' if operating_margin > 15 and gross_margin > 40 else 'Moderate' if operating_margin > 10 and gross_margin > 30 else 'Concentrated'}
+   - Competitive Position: {'Strong' if operating_margin > 20 else 'Moderate' if operating_margin > 10 else 'Weak'}
+"""
+        
+        return metrics, analysis
+        
+    except Exception as e:
+        logger.error(f"Error in Buffett analysis: {str(e)}\n{traceback.format_exc()}")
+        raise Exception(f"Could not complete Buffett analysis: {str(e)}")
 
-2. **Robust Financial Position**
-   - Conservative debt levels with debt/equity at {debt_to_equity:.1f}
-   - Strong liquidity with current ratio at {current_ratio:.1f}
-   - Attractive FCF yield of {fcf_yield:.1f}%, indicating quality earnings
+def get_board_level_analysis(ticker, metrics, financials, info):
+    """Generate board-level Warren Buffett style analysis"""
+    try:
+        # Get historical data for technical analysis
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1y")
+        
+        # Calculate technical indicators
+        hist['RSI'] = calculate_rsi(hist)
+        hist['MA50'] = hist['Close'].rolling(window=50).mean()
+        hist['MA200'] = hist['Close'].rolling(window=200).mean()
+        
+        # Get current values
+        current_price = float(info.get('currentPrice', hist['Close'].iloc[-1]))
+        current_rsi = float(hist['RSI'].iloc[-1])
+        ma50 = float(hist['MA50'].iloc[-1])
+        ma200 = float(hist['MA200'].iloc[-1])
+        
+        # Get key metrics with safe type conversion
+        market_cap = float(info.get('marketCap', 0)) / 1e9  # Convert to billions
+        pe_ratio = float(info.get('forwardPE', info.get('trailingPE', 0)))
+        profit_margin = float(info.get('profitMargin', 0)) * 100
+        revenue_growth = float(info.get('revenueGrowth', 0)) * 100
+        debt_to_equity = float(info.get('debtToEquity', 0))
+        
+        # Generate analysis sections
+        financial_health = f"""
+### Financial Health Assessment
+- Market Cap: ${market_cap:.1f}B
+- P/E Ratio: {pe_ratio:.1f}x
+- Profit Margin: {profit_margin:.1f}%
+- Revenue Growth: {revenue_growth:+.1f}%
+- Debt/Equity: {debt_to_equity:.1f}x
+"""
 
-3. **Attractive Valuation**
-   - Significant margin of safety at {margin_of_safety:.1f}%
-   - Forward P/E of {pe_ratio:.1f}x, below industry average
-   - Market cap of ${market_cap/1e9:.1f}B suggests stability with room for growth
+        technical_signals = f"""
+### Technical Signals
+- Current Price: ${current_price:.2f}
+- RSI ({current_rsi:.1f}): {"Overbought" if current_rsi > 70 else "Oversold" if current_rsi < 30 else "Neutral"}
+- MA50/MA200: {"Bullish" if ma50 > ma200 else "Bearish"} Trend
+"""
 
-#### 📊 Investment Strategy
-1. Entry Strategy:
-   - Current Price: ${current_price:.2f}
-   - Recommended Entry: Up to ${current_price * 1.15:.2f}
-   - Ideal Position Size: 5-7% of portfolio
+        # Risk assessment
+        risk_factors = []
+        if pe_ratio > 30:
+            risk_factors.append("High valuation multiple")
+        if debt_to_equity > 2:
+            risk_factors.append("High debt levels")
+        if profit_margin < 10:
+            risk_factors.append("Low profit margins")
+        if current_rsi > 70:
+            risk_factors.append("Overbought conditions")
+        
+        risk_section = f"""
+### Risk Assessment
+{"- " + "\\n- ".join(risk_factors) if risk_factors else "- No significant risk factors identified"}
+"""
 
-2. Risk Management:
-   - Set stop loss at ${current_price * 0.85:.2f}
-   - Monitor quarterly for maintenance of ROE and margins
-   - Review if debt/equity exceeds 80%"""
-
-        elif roe > 12 and debt_to_equity < 80 and margin_of_safety > 15:
-            analysis += f"""
-**Buy** 🔼
-
-{ticker} shows promising potential with solid fundamentals and reasonable valuation:
-
-1. **Good Profitability**
-   - Above-average ROE of {roe:.1f}%, showing good capital efficiency
-   - Competitive operating margins at {operating_margin:.1f}%
-   - Sustainable gross margins of {gross_margin:.1f}%
-
-2. **Sound Financial Health**
-   - Manageable debt with debt/equity at {debt_to_equity:.1f}
-   - Adequate liquidity position with current ratio at {current_ratio:.1f}
-   - Positive FCF yield of {fcf_yield:.1f}%
-
-3. **Fair Valuation**
-   - Reasonable margin of safety at {margin_of_safety:.1f}%
-   - Forward P/E of {pe_ratio:.1f}x suggests fair value
-   - Market cap of ${market_cap/1e9:.1f}B indicates established market position
-
-#### 📊 Investment Strategy
-1. Entry Strategy:
-   - Current Price: ${current_price:.2f}
-   - Recommended Entry: Up to ${current_price * 1.10:.2f}
-   - Suggested Position Size: 3-5% of portfolio
-
-2. Risk Management:
-   - Set stop loss at ${current_price * 0.90:.2f}
-   - Quarterly review of financial metrics
-   - Monitor competitive position"""
-
-        elif roe > 10 and debt_to_equity < 100 and margin_of_safety > 0:
-            analysis += f"""
-**Hold/Accumulate** ⏺
-
-{ticker} presents a balanced risk-reward profile with some concerns:
-
-1. **Moderate Profitability**
-   - Acceptable ROE of {roe:.1f}%, but room for improvement
-   - Operating margins of {operating_margin:.1f}% near industry average
-   - Gross margins of {gross_margin:.1f}% suggest moderate competitive position
-
-2. **Mixed Financial Health**
-   - Elevated debt levels with debt/equity at {debt_to_equity:.1f}
-   - Adequate liquidity with current ratio at {current_ratio:.1f}
-   - FCF yield of {fcf_yield:.1f}% indicates moderate cash generation
-
-3. **Neutral Valuation**
-   - Limited margin of safety at {margin_of_safety:.1f}%
-   - Forward P/E of {pe_ratio:.1f}x near fair value
-   - Market cap of ${market_cap/1e9:.1f}B suggests established presence
-
-#### 📊 Investment Strategy
-1. Position Management:
-   - Hold existing positions
-   - Consider adding below ${current_price * 0.90:.2f}
-   - Keep position size below 3% of portfolio
-
-2. Risk Management:
-   - Set stop loss at ${current_price * 0.85:.2f}
-   - Regular review of fundamentals
-   - Consider selling if metrics deteriorate"""
-
+        # Investment thesis
+        if pe_ratio < 20 and profit_margin > 15 and revenue_growth > 10:
+            recommendation = "Strong Buy"
+            thesis = "Company shows strong fundamentals with reasonable valuation"
+        elif pe_ratio < 25 and profit_margin > 10:
+            recommendation = "Buy"
+            thesis = "Solid performance with moderate growth potential"
+        elif pe_ratio > 40 or profit_margin < 5:
+            recommendation = "Sell"
+            thesis = "Valuation concerns and weak fundamentals"
         else:
-            analysis += f"""
-**Sell/Avoid** 🔻
-
-{ticker} shows several concerning factors that suggest elevated investment risk:
-
-1. **Weak Profitability**
-   - Below-average ROE of {roe:.1f}%, indicating poor capital efficiency
-   - Operating margins of {operating_margin:.1f}% suggest competitive pressures
-   - Gross margins of {gross_margin:.1f}% reflect limited pricing power
-
-2. **Financial Concerns**
-   - High debt levels with debt/equity at {debt_to_equity:.1f}
-   - Liquidity concerns with current ratio at {current_ratio:.1f}
-   - FCF yield of {fcf_yield:.1f}% indicates cash flow pressure
-
-3. **Unattractive Valuation**
-   - Negative margin of safety at {margin_of_safety:.1f}%
-   - Forward P/E of {pe_ratio:.1f}x suggests overvaluation
-   - Market cap of ${market_cap/1e9:.1f}B may limit downside protection
-
-#### 📊 Investment Strategy
-1. Action Items:
-   - Avoid new positions
-   - Consider selling existing holdings
-   - Look for better opportunities
-
-2. Exit Strategy:
-   - Sell above ${current_price * 1.05:.2f}
-   - Use any strength to reduce positions
-   - Reallocate to stronger opportunities"""
-
-        analysis += """
-
-#### 📘 Key Investment Principles
-1. **Circle of Competence**: Stay within businesses you understand
-2. **Margin of Safety**: Always buy at a discount to intrinsic value
-3. **Economic Moat**: Focus on sustainable competitive advantages
-4. **Financial Strength**: Prefer conservative financial management
-5. **Long-term Perspective**: Invest in businesses, not stocks
+            recommendation = "Hold"
+            thesis = "Monitor for better entry points"
+        
+        investment_thesis = f"""
+### Investment Recommendation: {recommendation}
+{thesis}
 """
+
+        # Combine all sections
+        analysis = f"""
+# Board-Level Analysis for {ticker}
+{financial_health}
+{technical_signals}
+{risk_section}
+{investment_thesis}
+"""
+        
         return analysis
         
     except Exception as e:
-        st.error(f"Error in analysis: {str(e)}")
-        return """
-### ⚠️ Analysis Error
-
-Unable to generate complete analysis due to missing or invalid data. This could be due to:
-1. Limited financial data availability
-2. Recent IPO or spinoff
-3. Complex corporate structure
-4. Temporary data provider issues
-
-Please verify the ticker symbol and try again later.
-"""
+        error_msg = f"Unable to generate complete board-level analysis: {str(e)}"
+        st.error(error_msg)
+        return error_msg
 
 def get_buffett_writeup(ticker, metrics):
     """Generate Warren Buffett style investment write-up"""
-    
-    def get_moat_assessment(metrics):
-        moat_strength = "Strong" if metrics['operating_margin'] > 20 and metrics['roe'] > 15 else \
-                       "Moderate" if metrics['operating_margin'] > 15 and metrics['roe'] > 12 else "Limited"
+    try:
+        # Safely get metrics with defaults
+        def safe_get(data, key, default=0):
+            try:
+                value = data.get(key, default)
+                return float(value) if value is not None else default
+            except (TypeError, ValueError):
+                return default
+        
+        # Extract metrics safely
+        operating_margin = safe_get(metrics, 'operating_margin', 0)
+        gross_margin = safe_get(metrics, 'gross_margin', 0)
+        profit_margin = safe_get(metrics, 'profit_margin', 0)
+        roe = safe_get(metrics, 'roe', 0)
+        current_ratio = safe_get(metrics, 'current_ratio', 0)
+        debt_to_equity = safe_get(metrics, 'debt_to_equity', 0)
+        market_cap = safe_get(metrics, 'market_cap', 0) / 1e9  # Convert to billions
+        pe_ratio = safe_get(metrics, 'pe_ratio', 0)
+        current_price = safe_get(metrics, 'current_price', 0)
+        revenue_growth = safe_get(metrics, 'revenue_growth', 0)
+        profit_growth = safe_get(metrics, 'profit_growth', 0)
+        
+        # Calculate fair value
+        if pe_ratio > 0 and pe_ratio < 100:
+            annual_earnings = current_price / pe_ratio
+        else:
+            annual_earnings = current_price * (profit_margin / 100)
+        
+        growth_rate = min(max((revenue_growth + profit_growth) / 2 / 100, 0.02), 0.15)
+        future_earnings = annual_earnings * (1 + growth_rate) ** 5
+        pe_multiple = min(max(10 + growth_rate * 100, 12), 20)
+        fair_value = max(future_earnings * pe_multiple, current_price * 0.5)
+        
+        # Calculate price targets
+        strong_buy_price = fair_value * 0.7  # 30% discount
+        buy_price = fair_value * 0.8  # 20% discount
+        sell_price = fair_value * 1.2  # 20% premium
+        stop_loss = current_price * 0.85  # 15% below current
+        
+        margin_of_safety = ((fair_value - current_price) / fair_value) * 100
+        
+        # Assess competitive advantages
+        moat_strength = "Strong" if operating_margin > 20 and roe > 15 else \
+                       "Moderate" if operating_margin > 15 and roe > 12 else "Limited"
         
         moat_factors = []
-        if metrics['operating_margin'] > 20:
+        if operating_margin > 20:
             moat_factors.append("high operating margins indicating pricing power")
-        if metrics['roe'] > 15:
+        if roe > 15:
             moat_factors.append("excellent return on equity showing competitive advantages")
-        if metrics['gross_margin'] > 40:
+        if gross_margin > 40:
             moat_factors.append("strong gross margins suggesting brand value")
-        if metrics['market_cap'] > 50e9:
+        if market_cap > 50:  # Already in billions
             moat_factors.append("significant market position")
-            
-        return moat_strength, moat_factors
-
-    def get_financial_health(metrics):
-        if metrics['current_ratio'] > 2 and metrics['debt_to_equity'] < 50:
-            health = "Excellent"
-        elif metrics['current_ratio'] > 1.5 and metrics['debt_to_equity'] < 80:
-            health = "Good"
+        if revenue_growth > 15:
+            moat_factors.append("strong revenue growth")
+        if profit_growth > 15:
+            moat_factors.append("impressive profit growth")
+        
+        # Assess financial health
+        health = "Excellent" if current_ratio > 2 and debt_to_equity < 50 else \
+                "Good" if current_ratio > 1.5 and debt_to_equity < 80 else "Fair"
+        
+        financial_strengths = []
+        if current_ratio > 2:
+            financial_strengths.append("strong liquidity position")
+        if debt_to_equity < 50:
+            financial_strengths.append("conservative debt management")
+        if profit_margin > 15:
+            financial_strengths.append("healthy profit margins")
+        if revenue_growth > 10:
+            financial_strengths.append("solid revenue growth")
+        
+        # Assess valuation
+        value = "Attractive" if pe_ratio < 15 and margin_of_safety > 25 else \
+                "Fair" if pe_ratio < 20 and margin_of_safety > 15 else "Expensive"
+        
+        value_reasons = []
+        if pe_ratio < 15:
+            value_reasons.append("reasonable P/E ratio")
+        if margin_of_safety > 25:
+            value_reasons.append("significant margin of safety")
+        if profit_margin > 15:
+            value_reasons.append("strong profitability")
+        
+        # Determine overall investment attractiveness
+        is_compelling = (moat_strength == "Strong" and health == "Excellent" and value == "Attractive")
+        is_potential = moat_strength != "Limited"
+        
+        # Generate summary and recommendation
+        if is_compelling:
+            action = "Strong Buy"
+            summary = f"Strong investment opportunity with compelling moat, excellent financials, and attractive valuation"
+            position_size = "5-7% of portfolio"
+        elif is_potential and value != "Expensive":
+            action = "Buy"
+            summary = f"Good investment opportunity with some competitive advantages and reasonable valuation"
+            position_size = "3-5% of portfolio"
+        elif is_potential:
+            action = "Hold/Monitor"
+            summary = f"Decent company but wait for better entry price"
+            position_size = "2-3% of portfolio"
         else:
-            health = "Fair"
-                
-        strengths = []
-        if metrics['current_ratio'] > 2:
-            strengths.append("strong liquidity position")
-        if metrics['debt_to_equity'] < 50:
-            strengths.append("conservative debt management")
-        if metrics['fcf_yield'] > 5:
-            strengths.append("healthy free cash flow generation")
-            
-        return health, strengths
-
-    def get_valuation_assessment(metrics):
-        if metrics['pe_ratio'] < 15 and metrics['margin_of_safety'] > 25:
-            value = "Attractive"
-        elif metrics['pe_ratio'] < 20 and metrics['margin_of_safety'] > 15:
-            value = "Fair"
-        else:
-            value = "Expensive"
-                
-        reasons = []
-        if metrics['pe_ratio'] < 15:
-            reasons.append("reasonable P/E ratio")
-        if metrics['margin_of_safety'] > 25:
-            reasons.append("significant margin of safety")
-        if metrics['fcf_yield'] > 5:
-            reasons.append("attractive free cash flow yield")
-            
-        return value, reasons
-
-    moat_strength, moat_factors = get_moat_assessment(metrics)
-    health, financial_strengths = get_financial_health(metrics)
-    value, value_reasons = get_valuation_assessment(metrics)
-    
-    # Determine overall investment attractiveness
-    is_compelling = (moat_strength == "Strong" and 
-                    health in ("Excellent", "Good") and 
-                    value in ("Attractive", "Fair"))
-    is_potential = moat_strength != "Limited"
-    
-    writeup = f"""
+            action = "Avoid"
+            summary = f"Limited competitive advantages and/or unfavorable valuation"
+            position_size = "0%"
+        
+        writeup = f"""
 ### 📝 Warren Buffett's Investment Write-up for {ticker}
 
 #### 🎯 Executive Summary
-As a value investor focused on high-quality businesses at reasonable prices, {ticker} presents a {'compelling' if is_compelling else 'potential' if is_potential else 'challenging'} investment opportunity.
+{summary}
+
+#### 💰 Price Analysis and Recommendations
+| Price Point | Value | Notes |
+|-------------|-------|-------|
+| Current Price | ${current_price:.2f} | - |
+| Fair Value | ${fair_value:.2f} | Based on fundamentals and growth |
+| Strong Buy Below | ${strong_buy_price:.2f} | Significant margin of safety |
+| Buy Below | ${buy_price:.2f} | Good entry point |
+| Sell Above | ${sell_price:.2f} | Consider taking profits |
+| Stop Loss | ${stop_loss:.2f} | Risk management level |
+
+**Recommended Action**: {action}
+**Position Size**: {position_size}
+**Margin of Safety**: {margin_of_safety:.1f}%
 
 #### 🏰 Economic Moat Analysis
-The company demonstrates a {moat_strength.lower()} economic moat, evidenced by {', '.join(moat_factors) if moat_factors else 'limited competitive advantages'}. {
-'This sustainable competitive advantage positions the company well for long-term value creation.' if moat_strength == 'Strong' else 
+The company demonstrates a {moat_strength.lower()} economic moat, evidenced by {', '.join(moat_factors) if moat_factors else 'Limited competitive advantages identified'}.
+{'This sustainable competitive advantage positions the company well for long-term value creation.' if moat_strength == 'Strong' else 
 'While showing some competitive strengths, the moat needs further development.' if moat_strength == 'Moderate' else
 'The lack of a strong economic moat raises concerns about long-term profitability.'
 }
 
 #### 💪 Business Strengths
 1. **Profitability Metrics**
-   | Metric | Value | Meaning | Assessment |
-   |--------|--------|---------|------------|
-   | Return on Equity (ROE) | {metrics['roe']:.1f}% | Measures how efficiently company uses shareholder money | {'Excellent' if metrics['roe'] > 15 else 'Good' if metrics['roe'] > 12 else 'Fair' if metrics['roe'] > 10 else 'Poor'} |
-   | Operating Margin | {metrics['operating_margin']:.1f}% | Indicates pricing power and operational efficiency | {'Excellent' if metrics['operating_margin'] > 25 else 'Good' if metrics['operating_margin'] > 15 else 'Fair' if metrics['operating_margin'] > 10 else 'Poor'} |
-   | Gross Margin | {metrics['gross_margin']:.1f}% | Shows pricing power and brand strength | {'Strong' if metrics['gross_margin'] > 40 else 'Good' if metrics['gross_margin'] > 30 else 'Fair' if metrics['gross_margin'] > 20 else 'Weak'} |
-   | Profit Margin | {metrics['profit_margin']:.1f}% | Net profit per dollar of revenue | {'Excellent' if metrics['profit_margin'] > 20 else 'Good' if metrics['profit_margin'] > 15 else 'Fair' if metrics['profit_margin'] > 10 else 'Poor'} |
+   | Metric | Value | Assessment |
+   |--------|--------|------------|
+   | Return on Equity | {roe:.1f}% | {'Excellent' if roe > 15 else 'Good' if roe > 12 else 'Fair' if roe > 10 else 'Poor'} |
+   | Operating Margin | {operating_margin:.1f}% | {'Excellent' if operating_margin > 25 else 'Good' if operating_margin > 15 else 'Fair' if operating_margin > 10 else 'Poor'} |
+   | Gross Margin | {gross_margin:.1f}% | {'Excellent' if gross_margin > 40 else 'Good' if gross_margin > 30 else 'Fair' if gross_margin > 20 else 'Poor'} |
 
-2. **Financial Position**
-The company's {health.lower()} financial health is supported by {', '.join(financial_strengths) if financial_strengths else 'adequate financial metrics'}. {
-'This strong financial foundation provides flexibility for future growth.' if health == 'Excellent' else
-'The financial position is stable but could be improved.' if health == 'Good' else
-'Financial metrics warrant careful monitoring.'
-}
+2. **Growth & Financial Health**
+   | Metric | Value | Assessment |
+   |--------|--------|------------|
+   | Revenue Growth | {revenue_growth:.1f}% | {'Excellent' if revenue_growth > 15 else 'Good' if revenue_growth > 10 else 'Fair' if revenue_growth > 5 else 'Poor'} |
+   | Profit Growth | {profit_growth:.1f}% | {'Excellent' if profit_growth > 15 else 'Good' if profit_growth > 10 else 'Fair' if profit_growth > 5 else 'Poor'} |
+   | Current Ratio | {current_ratio:.2f} | {'Excellent' if current_ratio > 2 else 'Good' if current_ratio > 1.5 else 'Fair' if current_ratio > 1 else 'Poor'} |
+   | Debt/Equity | {debt_to_equity:.1f}% | {'Excellent' if debt_to_equity < 30 else 'Good' if debt_to_equity < 60 else 'Fair' if debt_to_equity < 100 else 'Poor'} |
+   | Market Cap | ${market_cap:.1f}B | {'Large Cap' if market_cap > 10 else 'Mid Cap' if market_cap > 2 else 'Small Cap'} |
 
-#### 💰 Valuation Assessment
-At the current price of ${metrics['current_price']:.2f}, the valuation appears {value.lower()}, with {', '.join(value_reasons) if value_reasons else 'limited value characteristics'}. {
-'This presents an attractive entry point for long-term investors.' if value == 'Attractive' else
-'The price offers a reasonable balance of risk and reward.' if value == 'Fair' else
-'The current valuation leaves limited room for error.'
-}
+#### 📈 Investment Strategy
+1. **Entry Strategy**:
+   - Current Price: ${current_price:.2f}
+   - Ideal Entry: Below ${buy_price:.2f}
+   - Strong Entry: Below ${strong_buy_price:.2f}
+   - Position Size: {position_size}
 
-#### 🎯 Investment Recommendation
+2. **Exit Strategy**:
+   - Take Profits: Above ${sell_price:.2f}
+   - Stop Loss: ${stop_loss:.2f}
+   - Review Position: If fundamentals deteriorate
+
+3. **Monitoring Points**:
+   - Quarterly: Check operating margins and ROE
+   - Semi-Annual: Review competitive position
+   - Annual: Full valuation reassessment
+
+#### 💡 Key Investment Considerations
+1. **Competitive Advantages**: {', '.join(moat_factors) if moat_factors else 'Limited competitive advantages identified'}
+2. **Financial Strengths**: {', '.join(financial_strengths) if financial_strengths else 'Some financial concerns noted'}
+3. **Valuation Factors**: {', '.join(value_reasons) if value_reasons else 'Valuation appears unfavorable'}
+
+Remember: "Price is what you pay. Value is what you get." - Warren Buffett
 """
-    # Generate specific recommendation based on metrics
-    if moat_strength == "Strong" and health == "Excellent" and value == "Attractive":
-        writeup += f"""
-**Strong Buy** 📈
-1. Entry Strategy:
-   - Current Price: ${metrics['current_price']:.2f}
-   - Recommended Entry: Up to ${metrics['current_price'] * 1.15:.2f}
-   - Ideal Position Size: 5-7% of portfolio
-
-2. Investment Thesis:
-   - Strong economic moat with {', '.join(moat_factors)}
-   - {health} financial health supported by {', '.join(financial_strengths)}
-   - {value} valuation with {', '.join(value_reasons)}
-
-3. Risk Management:
-   - Set stop loss at ${metrics['current_price'] * 0.85:.2f}
-   - Monitor quarterly for maintenance of operating margins and ROE
-   - Review if debt/equity exceeds 80%"""
-
-    elif moat_strength != "Limited" and health != "Fair" and value != "Expensive":
-        writeup += f"""
-**Buy with Caution** 🔼
-1. Entry Strategy:
-   - Current Price: ${metrics['current_price']:.2f}
-   - Recommended Entry: Up to ${metrics['current_price'] * 1.10:.2f}
-   - Suggested Position Size: 3-5% of portfolio
-
-2. Investment Thesis:
-   - {moat_strength} moat characteristics
-   - {health} financial position
-   - {value} current valuation
-
-3. Risk Management:
-   - Set stop loss at ${metrics['current_price'] * 0.90:.2f}
-   - Quarterly review of competitive position
-   - Monitor financial metrics for deterioration"""
-
-    elif metrics['margin_of_safety'] > 0:
-        writeup += f"""
-**Hold/Accumulate** ⏺
-1. Position Management:
-   - Hold existing positions
-   - Consider adding below ${metrics['current_price'] * 0.90:.2f}
-   - Keep position size below 3% of portfolio
-
-2. Monitoring Points:
-   - Watch for moat strengthening
-   - Monitor financial health improvements
-   - Look for better entry points
-
-3. Risk Management:
-   - Set stop loss at ${metrics['current_price'] * 0.85:.2f}
-   - Regular review of business fundamentals
-   - Consider selling if metrics deteriorate"""
-
-    else:
-        writeup += f"""
-**Sell/Avoid** 🔻
-1. Action Items:
-   - Avoid new positions
-   - Consider selling existing holdings
-   - Look for better opportunities
-
-2. Concerns:
-   - Limited economic moat
-   - Challenging financial metrics
-   - Unattractive valuation
-
-3. Exit Strategy:
-   - Sell above ${metrics['current_price'] * 1.05:.2f}
-   - Use any strength to reduce positions
-   - Reallocate to stronger opportunities"""
-
-    writeup += """
-
-#### 📘 Key Principles Applied
-1. **Circle of Competence**: Stay within businesses you understand
-2. **Margin of Safety**: Always buy at a discount to intrinsic value
-3. **Economic Moat**: Focus on sustainable competitive advantages
-4. **Financial Strength**: Prefer conservative financial management
-5. **Long-term Perspective**: Invest in businesses, not stocks
-"""
-    
-    return writeup
-
-def get_buffett_analysis(ticker, financials, info):
-    """Generate Warren Buffett style analysis for a stock"""
-    try:
-        # Safely get values with defaults
-        def safe_get(data, key, default=0):
-            try:
-                value = data.get(key, default)
-                return float(value[0]) if isinstance(value, list) else float(value)
-            except (TypeError, ValueError, IndexError):
-                return default
-
-        # Calculate key Buffett metrics with safe division
-        def safe_divide(a, b, default=0):
-            try:
-                return float(a) / float(b) if float(b) != 0 else default
-            except (TypeError, ValueError):
-                return default
-
-        # Get basic metrics
-        market_cap = safe_get(info, 'marketCap')
-        revenue = safe_get(financials, 'Total Revenue')
-        net_income = safe_get(financials, 'Net Income')
-        total_assets = safe_get(financials, 'Total Assets')
-        total_debt = safe_get(financials, 'Total Debt')
-        cash = safe_get(financials, 'Cash')
-        operating_margin = safe_get(info, 'operatingMargins', 0) * 100
-        current_price = safe_get(info, 'currentPrice')
-        shares_outstanding = safe_get(info, 'sharesOutstanding', 1)
-        
-        # Calculate ratios safely
-        pe_ratio = safe_get(info, 'forwardPE')
-        profit_margin = safe_divide(net_income, revenue) * 100
-        debt_to_equity = safe_get(info, 'debtToEquity')
-        current_ratio = safe_get(info, 'currentRatio')
-        roa = safe_divide(net_income, total_assets) * 100
-        roe = safe_get(info, 'returnOnEquity', 0) * 100
-        gross_margin = safe_get(info, 'grossMargins', 0) * 100
-        
-        # Calculate FCF and yield
-        fcf = safe_get(financials, 'Free Cash Flow')
-        fcf_yield = safe_divide(fcf, market_cap) * 100 if market_cap > 0 else 0
-        
-        # Calculate intrinsic value using simple DCF with safety checks
-        growth_rate = max(min(safe_get(info, 'revenueGrowth', 0.05), 0.15), 0)  # Cap between 0% and 15%
-        discount_rate = 0.10  # 10% discount rate
-        years = 10
-        
-        if fcf > 0:
-            future_fcf = fcf * (1 + growth_rate) ** years
-            terminal_value = future_fcf / (discount_rate - growth_rate) if discount_rate > growth_rate else fcf * 15
-            present_value = terminal_value / (1 + discount_rate) ** years
-            intrinsic_value = present_value / shares_outstanding if shares_outstanding > 0 else current_price
-        else:
-            # Fallback to a simple earnings-based valuation
-            intrinsic_value = (net_income * 15) / shares_outstanding if shares_outstanding > 0 else current_price
-        
-        # Calculate margin of safety with check for positive intrinsic value
-        margin_of_safety = safe_divide((intrinsic_value - current_price), intrinsic_value) * 100 if intrinsic_value > 0 else -100
-        
-        # Get company info with defaults
-        sector = info.get('sector', 'Unknown')
-        industry = info.get('industry', 'Unknown')
-        business_summary = info.get('longBusinessSummary', 'No business summary available.')
-
-        # Collect metrics for write-up
-        metrics = {
-            'operating_margin': float(operating_margin),
-            'roe': float(roe),
-            'gross_margin': float(gross_margin),
-            'current_ratio': float(current_ratio),
-            'debt_to_equity': float(debt_to_equity),
-            'fcf_yield': float(fcf_yield),
-            'pe_ratio': float(pe_ratio),
-            'margin_of_safety': float(margin_of_safety),
-            'current_price': float(current_price),
-            'market_cap': float(market_cap),
-            'profit_margin': float(profit_margin)
-        }
-        
-        # Generate main analysis and write-up
-        analysis = f"""
-### 🎩 Warren Buffett's Analysis of {ticker}
-
-#### 💼 Business Overview
-_{business_summary[:300]}..._
-
-#### 📊 Key Buffett Metrics and Their Meaning
-
-1. **Profitability Metrics**
-   | Metric | Value | Meaning | Assessment |
-   |--------|--------|---------|------------|
-   | Return on Equity (ROE) | {roe:.1f}% | Measures how efficiently company uses shareholder money | {'Excellent' if roe > 15 else 'Good' if roe > 12 else 'Fair' if roe > 10 else 'Poor'} |
-   | Operating Margin | {operating_margin:.1f}% | Indicates pricing power and operational efficiency | {'Excellent' if operating_margin > 25 else 'Good' if operating_margin > 15 else 'Fair' if operating_margin > 10 else 'Poor'} |
-   | Gross Margin | {gross_margin:.1f}% | Shows pricing power and brand strength | {'Strong' if gross_margin > 40 else 'Good' if gross_margin > 30 else 'Fair' if gross_margin > 20 else 'Weak'} |
-   | Profit Margin | {profit_margin:.1f}% | Net profit per dollar of revenue | {'Excellent' if profit_margin > 20 else 'Good' if profit_margin > 15 else 'Fair' if profit_margin > 10 else 'Poor'} |
-
-2. **Financial Health**
-   | Metric | Value | Meaning | Assessment |
-   |--------|--------|---------|------------|
-   | Debt/Equity | {debt_to_equity:.1f} | Measures financial leverage | {'Conservative' if debt_to_equity < 50 else 'Moderate' if debt_to_equity < 100 else 'High'} |
-   | Current Ratio | {current_ratio:.1f} | Shows ability to pay short-term obligations | {'Strong' if current_ratio > 2 else 'Adequate' if current_ratio > 1.5 else 'Weak'} |
-   | FCF Yield | {fcf_yield:.1f}% | Indicates cash generation relative to price | {'Excellent' if fcf_yield > 8 else 'Good' if fcf_yield > 5 else 'Fair' if fcf_yield > 3 else 'Poor'} |
-
-3. **Growth and Value**
-   | Metric | Value | Meaning | Assessment |
-   |--------|--------|---------|------------|
-   | Forward P/E | {pe_ratio:.1f}x | Price relative to earnings | {'Attractive' if pe_ratio < 15 else 'Fair' if pe_ratio < 20 else 'Premium' if pe_ratio < 25 else 'Expensive'} |
-   | Growth Rate | {growth_rate*100:.1f}% | Expected annual growth | {'Strong' if growth_rate > 0.15 else 'Good' if growth_rate > 0.10 else 'Fair' if growth_rate > 0.05 else 'Low'} |
-   | Market Cap | ${market_cap/1e9:.1f}B | Company size and stability | {'Large Cap' if market_cap > 10e9 else 'Mid Cap' if market_cap > 2e9 else 'Small Cap'} |
-
-#### 💰 Valuation Analysis
-- Current Price: ${current_price:.2f}
-- Estimated Intrinsic Value: ${intrinsic_value:.2f}
-- Margin of Safety: {margin_of_safety:.1f}%
-"""
-        
-        # Add detailed write-up
-        analysis += get_buffett_writeup(ticker, metrics)
-        
-        return analysis
+        return writeup
         
     except Exception as e:
-        st.error(f"Error in analysis: {str(e)}")
-        return """
-### ⚠️ Analysis Error
-
-Unable to generate complete analysis due to missing or invalid data. This could be due to:
-1. Limited financial data availability
-2. Recent IPO or spinoff
-3. Complex corporate structure
-4. Temporary data provider issues
-
-Please verify the ticker symbol and try again later.
-"""
+        error_msg = f"Error generating Buffett analysis: {str(e)}"
+        st.error(error_msg)
+        return error_msg
 
 def buffett_analysis_tab():
     """Display Warren Buffett style analysis tab"""
-    st.header("🎩 Warren Buffett Analysis")
-    
-    # Get user input
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        ticker = st.text_input("Enter Stock Ticker:", value="AAPL").upper()
-    with col2:
-        st.write("")  # Spacing
-        analyze_button = st.button("Analyze Stock", type="primary")
-    with col3:
-        st.write("")  # Spacing
-        st.caption("'Price is what you pay. Value is what you get.' - Warren Buffett")
+    try:
+        st.header("🎩 Warren Buffett Analysis")
         
-    if analyze_button and ticker:
-        try:
-            # Show loading message
-            with st.spinner(f"Analyzing {ticker} through Warren Buffett's lens..."):
-                # Get stock data
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                financials = stock.financials.to_dict()
+        # Get stock data and analysis
+        ticker = st.session_state.get('ticker', '')
+        if not ticker:
+            st.warning("Please enter a stock ticker in the sidebar.")
+            return
+        
+        # Get financial data
+        with st.spinner("Analyzing stock fundamentals..."):
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            if not info:
+                st.error(f"Could not fetch data for {ticker}. Please verify the ticker symbol.")
+                return
                 
-                # Create tabs for different views
-                tab1, tab2 = st.tabs(["📝 Analysis", "📈 Performance"])
-                
-                with tab1:
-                    # Generate and display analysis
-                    analysis = get_buffett_analysis(ticker, financials, info)
-                    st.markdown(analysis)
-                    
-                with tab2:
-                    # Show historical performance
-                    st.subheader("Historical Performance")
-                    hist = stock.history(period="5y")
-                    if not hist.empty:
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=hist.index,
-                            y=hist['Close'],
-                            name='Stock Price',
-                            line=dict(color='#2E86C1')
-                        ))
-                        fig.update_layout(
-                            title=f"{ticker} 5-Year Price History",
-                            xaxis_title="Date",
-                            yaxis_title="Price ($)",
-                            showlegend=True,
-                            height=400,
-                            template="plotly_white"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Add key statistics
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            price_change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
-                            st.metric("5-Year Return", f"{price_change:.1f}%")
-                        with col2:
-                            max_price = hist['High'].max()
-                            st.metric("5-Year High", f"${max_price:.2f}")
-                        with col3:
-                            min_price = hist['Low'].min()
-                            st.metric("5-Year Low", f"${min_price:.2f}")
-                
-        except Exception as e:
-            st.error(f"Error analyzing {ticker}: {str(e)}")
-            st.info("Please check the ticker symbol and try again.")
+            # Get financials with error handling
+            try:
+                financials = stock.financials
+            except Exception as e:
+                st.warning(f"Could not fetch complete financial data. Using available metrics only.")
+                financials = pd.DataFrame()
             
+            # Test Ollama connection
+            llm_available, llm_message = test_ollama_connection("Ollama 3.2")
+            if not llm_available:
+                st.warning(f"LLM service not available: {llm_message}")
+                st.info("Proceeding with traditional analysis...")
+            
+            # Get metrics and analysis
+            metrics, analysis = get_buffett_analysis(ticker, financials, info)
+            
+            # Display analysis
+            st.markdown(analysis)
+            
+            # Generate letter if LLM is available and add it in a collapsible section
+            if llm_available:
+                with st.expander("📝 Warren Buffett's Perspective", expanded=False):
+                    letter = get_shareholder_letter(ticker, metrics)
+                    st.markdown(letter)
+            
+            # Add technical analysis in expander
+            with st.expander("📊 Technical Analysis Details"):
+                # Get historical data
+                hist = stock.history(period="1y")
+                if not hist.empty:
+                    # Calculate indicators
+                    hist['RSI'] = calculate_rsi(hist['Close'])
+                    hist['MA50'] = hist['Close'].rolling(window=50).mean()
+                    hist['MA200'] = hist['Close'].rolling(window=200).mean()
+                    
+                    # Create technical analysis chart
+                    fig = go.Figure()
+                    
+                    # Add price
+                    fig.add_trace(go.Candlestick(
+                        x=hist.index,
+                        open=hist['Open'],
+                        high=hist['High'],
+                        low=hist['Low'],
+                        close=hist['Close'],
+                        name='Price'
+                    ))
+                    
+                    # Add moving averages
+                    fig.add_trace(go.Scatter(
+                        x=hist.index,
+                        y=hist['MA50'],
+                        name='50-day MA',
+                        line=dict(color='orange')
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=hist.index,
+                        y=hist['MA200'],
+                        name='200-day MA',
+                        line=dict(color='blue')
+                    ))
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title=f"{ticker} - Technical Analysis",
+                        yaxis_title="Price",
+                        xaxis_title="Date",
+                        height=600
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Display current technical signals
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.metric(
+                            "RSI (14)",
+                            f"{hist['RSI'].iloc[-1]:.1f}",
+                            help="Relative Strength Index. Values > 70 indicate overbought, < 30 oversold"
+                        )
+                        
+                        st.metric(
+                            "50-day MA",
+                            f"${hist['MA50'].iloc[-1]:.2f}",
+                            f"{((hist['Close'].iloc[-1] / hist['MA50'].iloc[-1] - 1) * 100):.1f}%",
+                            help="50-day Moving Average"
+                        )
+                        
+                    with col2:
+                        st.metric(
+                            "200-day MA",
+                            f"${hist['MA200'].iloc[-1]:.2f}",
+                            f"{((hist['Close'].iloc[-1] / hist['MA200'].iloc[-1] - 1) * 100):.1f}%",
+                            help="200-day Moving Average"
+                        )
+                        
+                        trend = "Bullish" if hist['MA50'].iloc[-1] > hist['MA200'].iloc[-1] else "Bearish"
+                        st.metric(
+                            "Trend",
+                            trend,
+                            help="Based on 50-day MA vs 200-day MA"
+                        )
+                else:
+                    st.warning("No historical data available for technical analysis.")
+                    
+    except Exception as e:
+        st.error(f"Error in Buffett analysis tab: {str(e)}")
+        st.info("Please verify the ticker symbol and try again.")
+
 def get_analyst_writeup(ticker, model_type="Ollama 3.2"):
     """Get detailed analyst writeup for a stock using LLM"""
     try:
@@ -2009,10 +1825,10 @@ def technical_analysis_tab():
         
         with col1:
             ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="tech_ticker").upper()
-            
+        
         with col2:
             period = st.selectbox(
-                "Select Time Period:",
+                "Select Time Period",
                 ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
                 index=3,
                 key="tech_period"
@@ -2085,11 +1901,7 @@ def technical_analysis_tab():
                     hist_data['BB_Middle'] = bb_middle
                 
                 if show_rsi:
-                    delta = hist_data['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=rsi_period).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=rsi_period).mean()
-                    rs = gain / loss
-                    hist_data['RSI'] = 100 - (100 / (1 + rs))
+                    hist_data['RSI'] = calculate_rsi(hist_data, rsi_period)
                 
                 # Create figure with secondary y-axis
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -2207,8 +2019,120 @@ def technical_analysis_tab():
     except Exception as e:
         st.error(f"Error in technical analysis tab: {str(e)}")
 
+def calculate_rsi(data, periods=14):
+    """Calculate Relative Strength Index"""
+    try:
+        # Convert data to Series if it's not already
+        if isinstance(data, pd.DataFrame):
+            close_prices = data['Close']
+        else:
+            close_prices = pd.Series(data)
+            
+        # Calculate price changes
+        delta = close_prices.diff()
+        
+        # Separate gains (up) and losses (down)
+        gains = delta.where(delta > 0, 0)
+        losses = -delta.where(delta < 0, 0)
+        
+        # Calculate average gains and losses
+        avg_gains = gains.ewm(com=periods - 1, adjust=True, min_periods=periods).mean()
+        avg_losses = losses.ewm(com=periods - 1, adjust=True, min_periods=periods).mean()
+        
+        # Calculate relative strength
+        rs = avg_gains / avg_losses
+        
+        # Calculate RSI
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+        
+    except Exception as e:
+        st.error(f"Error calculating RSI: {str(e)}")
+        if isinstance(data, pd.DataFrame):
+            return pd.Series(index=data.index)
+        return pd.Series()
+
+def calculate_macd(data, fast_period=12, slow_period=26, signal_period=9):
+    """Calculate MACD (Moving Average Convergence Divergence)"""
+    try:
+        # Convert data to Series if it's not already
+        if isinstance(data, pd.DataFrame):
+            close_prices = data['Close']
+        else:
+            close_prices = pd.Series(data)
+            
+        # Calculate EMAs
+        fast_ema = close_prices.ewm(span=fast_period, min_periods=fast_period).mean()
+        slow_ema = close_prices.ewm(span=slow_period, min_periods=slow_period).mean()
+        
+        # Calculate MACD line
+        macd = fast_ema - slow_ema
+        
+        # Calculate signal line
+        signal = macd.ewm(span=signal_period, min_periods=signal_period).mean()
+        
+        # Calculate histogram
+        hist = macd - signal
+        
+        return macd, signal, hist
+        
+    except Exception as e:
+        st.error(f"Error calculating MACD: {str(e)}")
+        if isinstance(data, pd.DataFrame):
+            return pd.Series(index=data.index), pd.Series(index=data.index), pd.Series(index=data.index)
+        return pd.Series(), pd.Series(), pd.Series()
+
+def get_shareholder_letter(ticker, metrics):
+    """Generate a detailed letter to shareholders using LLM analysis"""
+    try:
+        # Extract key metrics
+        current_price = metrics.get('current_price', 0)
+        pe_ratio = metrics.get('pe_ratio', 0)
+        market_cap = metrics.get('market_cap', 0) / 1e9  # Convert to billions
+        revenue_growth = metrics.get('revenue_growth', 0)
+        profit_margin = metrics.get('profit_margin', 0)
+        roe = metrics.get('roe', 0)
+        debt_to_equity = metrics.get('debt_to_equity', 0)
+        
+        # Create prompt for LLM
+        prompt = f"""
+        As Warren Buffett, write a detailed letter to shareholders about {ticker} stock analysis. 
+        Include:
+        1. Investment Thesis
+        2. Growth Catalysts
+        3. Competitive Advantages
+        4. Risk Factors
+        5. Valuation Analysis
+        6. Price Target Range
+        
+        Format your response in markdown with clear sections and bullet points.
+        Be specific and use data where relevant.
+        Keep the analysis concise but comprehensive.
+        """
+        
+        # Get LLM response
+        response = get_llm_response(prompt)
+        if not response:
+            return "Error: Unable to generate letter to shareholders. LLM service unavailable."
+            
+        return f"""
+### 📝 Letter to Shareholders: {ticker} Analysis
+#### From the Desk of Warren Buffett
+
+{response}
+
+*Note: This analysis is AI-generated in the style of Warren Buffett's letters to shareholders.*
+"""
+    except Exception as e:
+        return f"Error generating shareholder letter: {str(e)}"
+
 def main():
     st.title("Stock Analysis App")
+    
+    # Initialize session state for ticker if not exists
+    if 'ticker' not in st.session_state:
+        st.session_state.ticker = 'AAPL'
     
     # Create tabs
     chart_tabs = st.tabs([
@@ -2222,51 +2146,70 @@ def main():
     ])
     
     # Get stock ticker input (shared across tabs)
-    ticker = st.sidebar.text_input("Enter Stock Ticker:", "AAPL", key="sidebar_ticker").upper()
+    ticker = st.sidebar.text_input(
+        "Enter Stock Ticker:",
+        value=st.session_state.ticker,
+        key="sidebar_ticker"
+    ).upper()
+    
+    # Update session state
+    st.session_state.ticker = ticker
     
     if ticker:
-        # Daily Chart Tab
-        with chart_tabs[0]:
-            chart = plot_daily_candlestick(ticker)
-            if chart is not None:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.error(f"Unable to fetch daily chart data for {ticker}")
-        
-        # Historical Charts Tab
-        with chart_tabs[1]:
-            st.subheader(f"Historical Price Charts - {ticker}")
-            period = st.selectbox(
-                "Select Time Period",
-                ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
-                index=3
-            )
-            chart = plot_stock_history(ticker, period)
-            if chart is not None:
-                st.plotly_chart(chart, use_container_width=True)
-            else:
-                st.error(f"Unable to fetch historical data for {ticker}")
-        
-        # Price Prediction Tab
-        with chart_tabs[2]:
-            prediction_tab()
-        
-        # Buffett Analysis Tab
-        with chart_tabs[3]:
-            buffett_analysis_tab()
+        try:
+            # Validate ticker
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            if not info:
+                st.sidebar.error(f"Invalid ticker: {ticker}")
+                return
+                
+            st.sidebar.success(f"Analyzing {ticker}: {info.get('longName', '')}")
             
-        # Stock Recommendations Tab
-        with chart_tabs[4]:
-            recommendations_tab()
-        
-        # Market Movers Tab
-        with chart_tabs[5]:
-            market_movers_tab()
+            # Daily Chart Tab
+            with chart_tabs[0]:
+                chart = plot_daily_candlestick(ticker)
+                if chart is not None:
+                    st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.error(f"Unable to fetch daily chart data for {ticker}")
             
-        # Technical Analysis Tab
-        with chart_tabs[6]:
-            technical_analysis_tab()
+            # Historical Charts Tab
+            with chart_tabs[1]:
+                st.subheader(f"Historical Price Charts - {ticker}")
+                period = st.selectbox(
+                    "Select Time Period",
+                    ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
+                    index=3
+                )
+                chart = plot_stock_history(ticker, period)
+                if chart is not None:
+                    st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.error(f"Unable to fetch historical data for {ticker}")
             
+            # Price Prediction Tab
+            with chart_tabs[2]:
+                prediction_tab()
+            
+            # Buffett Analysis Tab
+            with chart_tabs[3]:
+                buffett_analysis_tab()
+                
+            # Stock Recommendations Tab
+            with chart_tabs[4]:
+                recommendations_tab()
+            
+            # Market Movers Tab
+            with chart_tabs[5]:
+                market_movers_tab()
+                
+            # Technical Analysis Tab
+            with chart_tabs[6]:
+                technical_analysis_tab()
+                
+        except Exception as e:
+            st.sidebar.error(f"Error analyzing {ticker}: {str(e)}")
     else:
         st.warning("Please enter a stock ticker to begin analysis.")
 

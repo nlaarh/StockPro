@@ -83,379 +83,149 @@ def test_ollama_connection(model_type="Ollama 3.2"):
     except Exception as e:
         return False, f"Unexpected error testing {model_type} connection: {str(e)}"
 
-def predict_stock_price(data, prediction_days, model_type="Random Forest"):
+def predict_stock_price(data, prediction_days=7, model_type="Random Forest"):
     """Predict stock prices using various models"""
     try:
-        # If LLM model is selected, test connection first
-        if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
-            # Test model availability
-            is_available, message = test_ollama_connection(model_type)
-            if not is_available:
-                st.error(message)
-                st.warning("Falling back to Random Forest model...")
-                model_type = "Random Forest"
-            else:
-                try:
-                    # Get current metrics
-                    current_price = data['Close'].iloc[-1]
-                    rsi = data['RSI'].iloc[-1]
-                    macd = data['MACD'].iloc[-1]
-                    ma20 = data['MA20'].iloc[-1]
-                    ma50 = data['MA50'].iloc[-1]
-                    
-                    # Create an improved prompt for better results
-                    prompt = f"""You are a stock market expert. Analyze the following technical indicators and predict the stock price changes for the next {prediction_days} days:
-
-Current Price: ${current_price:.2f}
-Technical Analysis:
-- RSI: {rsi:.2f} (>70 overbought, <30 oversold)
-- MACD: {macd:.2f} (momentum indicator)
-- 20-day MA: ${ma20:.2f}
-- 50-day MA: ${ma50:.2f}
-
-Based on these indicators, predict the daily price changes as a percentage for each of the next {prediction_days} days.
-Format your response exactly like this example:
-Day 1: +0.5%
-Day 2: -0.3%
-Day 3: +0.8%
-...
-Explanation: [Your brief technical analysis here]
-"""
-
-                    # Make API call to Ollama
-                    response = requests.post(
-                        'http://localhost:11434/api/generate',
-                        json={
-                            'model': 'llama3.2' if model_type == "Ollama 3.2" else "deepseek-coder",
-                            'prompt': prompt,
-                            'stream': False
-                        },
-                        timeout=15
-                    )
-
-                    if response.status_code == 200:
-                        # Parse the response
-                        result = response.json()['response']
-                        
-                        # Extract daily predictions
-                        predictions = []
-                        lines = result.split('\n')
-                        for line in lines:
-                            if line.startswith('Day '):
-                                try:
-                                    pct = float(line.split(':')[1].strip().strip('%'))
-                                    predictions.append(1 + (pct/100))
-                                except:
-                                    continue
-                        
-                        if predictions:
-                            # Calculate cumulative price changes
-                            y_test = data['Close'].values[-prediction_days:]
-                            y_pred = [current_price]
-                            for pct in predictions[:prediction_days]:
-                                y_pred.append(y_pred[-1] * pct)
-                            y_pred = np.array(y_pred[1:])
-                            
-                            # Calculate confidence bands (±1%)
-                            confidence_lower = y_pred * 0.99
-                            confidence_upper = y_pred * 1.01
-                            
-                            return y_pred, y_test, (confidence_lower, confidence_upper)
-                            
-                    # If we get here, something went wrong with the LLM
-                    st.error("Error getting prediction from LLM model. Falling back to Random Forest...")
-                    model_type = "Random Forest"
-                    
-                except Exception as e:
-                    st.error(f"Error using LLM model: {str(e)}")
-                    st.warning("Falling back to Random Forest model...")
-                    model_type = "Random Forest"
+        # Ensure we have enough data
+        if len(data) < 60:  # Minimum data points needed
+            st.error("Insufficient historical data for prediction")
+            return None
+            
+        # Prepare features
+        data = data.copy()
+        data['MA5'] = data['Close'].rolling(window=5).mean()
+        data['MA20'] = data['Close'].rolling(window=20).mean()
+        data['RSI'] = calculate_rsi(data)
+        data['MACD'] = calculate_macd(data['Close'])[0]
         
-        # Handle ML models
+        # Fill NaN values
+        data = data.ffill().bfill()
+        
+        # Choose and train model
+        if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
+            try:
+                # Get current price and technical indicators
+                current_price = float(data['Close'].iloc[-1])
+                
+                # Format recent price history
+                recent_prices = data['Close'].iloc[-5:].tolist()
+                price_history = ", ".join([f"{p:.2f}" for p in recent_prices])
+                
+                # Create a strict prompt that forces array output
+                prompt = f"""You are a stock price prediction model. Your task is to predict {prediction_days} future stock prices.
+
+IMPORTANT: You must respond with ONLY a JSON array of {prediction_days} numbers representing daily prices. No other text.
+
+Current price: {current_price:.2f}
+Recent prices: {price_history}
+
+Example response format:
+[{current_price+0.5}, {current_price+1.0}, {current_price+1.5}]
+
+YOUR RESPONSE (ONLY numbers in array format):"""
+
+                # Set up API call
+                model_name = "llama3.2" if model_type == "Ollama 3.2" else "deepseek-r1"
+                
+                # Make API call
+                response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "temperature": 0.1
+                    },
+                    timeout=30
+                )
+                
+                if response.status_code != 200:
+                    raise Exception(f"LLM API returned status code {response.status_code}")
+                
+                # Parse response
+                result = response.json()
+                response_text = result.get('response', '').strip()
+                
+                # Find JSON array in response
+                array_pattern = r'\[[\d\s,.]+\]'
+                matches = re.findall(array_pattern, response_text)
+                
+                if not matches:
+                    raise ValueError("No valid predictions found")
+                
+                # Process first valid array found
+                predictions = None
+                for potential_json in matches:
+                    try:
+                        clean_json = re.sub(r'[^\[\]\d.,]', '', potential_json)
+                        pred_array = json.loads(clean_json)
+                        if isinstance(pred_array, list):
+                            predictions = [float(p) for p in pred_array]
+                            if len(predictions) >= prediction_days:
+                                predictions = predictions[:prediction_days]
+                                break
+                    except:
+                        continue
+                
+                if predictions is None or len(predictions) != prediction_days:
+                    raise ValueError(f"Failed to get {prediction_days} valid predictions")
+                
+                # Calculate confidence bands (±2%)
+                confidence_lower = [p * 0.98 for p in predictions]
+                confidence_upper = [p * 1.02 for p in predictions]
+                
+                return predictions, None, (confidence_lower, confidence_upper)
+                
+            except Exception as e:
+                logger.error(f"LLM prediction error: {str(e)}")
+                # Fall back to Random Forest
+                model_type = "Random Forest"
+        
         if model_type in ["Random Forest", "XGBoost", "LightGBM"]:
-            # Prepare the data
+            # Prepare features for ML models
+            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'MA5', 'MA20', 'RSI', 'MACD']
+            X = data[features].values
+            y = data['Close'].values
+            
+            # Scale the data
             scaler = MinMaxScaler()
-            scaled_data = scaler.fit_transform(data[['Close', 'RSI', 'MACD', 'MA20', 'MA50', 'Volume']].values)
+            X_scaled = scaler.fit_transform(X)
             
-            # Create sequences
-            X = []
-            y = []
-            sequence_length = 60  # Use last 60 days for prediction
-            
-            for i in range(sequence_length, len(scaled_data)):
-                X.append(scaled_data[i-sequence_length:i])
-                y.append(scaled_data[i, 0])  # 0 index is the Close price
-            
-            X = np.array(X)
-            y = np.array(y)
-            
-            # Split data
-            split = int(0.8 * len(X))
-            X_train, X_test = X[:split], X[split:]
-            y_train, y_test = y[:split], y[split:]
-            
-            # Select and train model
+            # Train on all data except last sequence
             if model_type == "Random Forest":
                 model = RandomForestRegressor(n_estimators=100, random_state=42)
-                model.fit(X_train.reshape(X_train.shape[0], -1), y_train)
             elif model_type == "XGBoost":
-                model = xgb.XGBRegressor(random_state=42)
-                model.fit(X_train.reshape(X_train.shape[0], -1), y_train)
+                model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
             else:  # LightGBM
-                model = lgb.LGBMRegressor(random_state=42)
-                model.fit(X_train.reshape(X_train.shape[0], -1), y_train)
+                model = lgb.LGBMRegressor(objective='regression', random_state=42)
             
-            # Make predictions
-            last_sequence = scaled_data[-sequence_length:]
-            predictions = []
+            # Fit model on all data
+            model.fit(X_scaled, y)
+            
+            # Generate predictions
+            future_pred = []
+            last_data = X_scaled[-1:]  # Start with last known data point
             
             for _ in range(prediction_days):
-                # Reshape sequence for prediction
-                current_pred = model.predict(last_sequence.reshape(1, -1))
-                predictions.append(current_pred[0])
+                # Predict next value
+                pred = float(model.predict(last_data)[0])
+                future_pred.append(pred)
                 
-                # Update sequence
-                last_sequence = np.roll(last_sequence, -1, axis=0)
-                last_sequence[-1] = np.append(current_pred, scaled_data[-1, 1:])
+                # Update last_data for next prediction
+                new_row = last_data.copy()
+                new_row[0, features.index('Close')] = pred
+                last_data = new_row
             
-            # Inverse transform predictions
-            predictions = np.array(predictions).reshape(-1, 1)
-            dummy = np.zeros((len(predictions), scaled_data.shape[1]-1))
-            predictions = np.hstack((predictions, dummy))
-            predictions = scaler.inverse_transform(predictions)[:, 0]
+            # Calculate confidence bands (±2%)
+            confidence_lower = [p * 0.98 for p in future_pred]
+            confidence_upper = [p * 1.02 for p in future_pred]
             
-            return predictions
-        
+            return future_pred, None, (confidence_lower, confidence_upper)
+            
     except Exception as e:
         logger.error(f"Error in prediction: {str(e)}")
-        logger.error(traceback.format_exc())
+        st.error(f"Error in prediction: {str(e)}")
         return None
-
-def prediction_tab():
-    """Stock price prediction tab"""
-    try:
-        st.header("🔮 Stock Price Prediction")
-        
-        # Get user input
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="prediction_ticker").upper()
-        
-        # Model selection
-        model_type = st.selectbox(
-            "Select Model",
-            ["Random Forest", "XGBoost", "LightGBM", "Ollama 3.2", "DeepSeek-R1"],
-            help="Choose the model for prediction",
-            key="prediction_model"
-        )
-        
-        # Prediction days
-        prediction_days = st.slider(
-            "Prediction Days",
-            min_value=1,
-            max_value=30,
-            value=7,
-            help="Number of days to predict into the future",
-            key="prediction_days"
-        )
-        
-        # Model information
-        with st.expander("Model Information"):
-            st.write("""
-            **Available Models:**
-            - **Random Forest**: Ensemble method, good for stable predictions
-            - **XGBoost**: Gradient boosting, excellent for capturing trends
-            - **LightGBM**: Fast gradient boosting, good for large datasets
-            - **Ollama 3.2**: Advanced LLM for market analysis and predictions
-            - **DeepSeek-R1**: Specialized LLM for financial forecasting
-            """)
-        
-        if st.button("Generate Prediction", key="generate_prediction"):
-            with st.spinner("Fetching data and generating prediction..."):
-                try:
-                    # Get stock data safely
-                    stock = yf.Ticker(ticker)
-                    info = stock.info
-                    
-                    # Safely get current price and create initial metrics
-                    current_price = float(info.get('currentPrice', 0))
-                    if current_price == 0:
-                        hist = stock.history(period="1d")
-                        if not hist.empty:
-                            current_price = float(hist['Close'].iloc[-1])
-                    
-                    # Get historical data for technical analysis
-                    data = stock.history(period="1y")
-                    if data.empty:
-                        st.error(f"No data found for {ticker}")
-                        return
-                    
-                    # Process technical indicators
-                    data['MA20'] = data['Close'].rolling(window=20).mean()
-                    data['MA50'] = data['Close'].rolling(window=50).mean()
-                    data['MA200'] = data['Close'].rolling(window=200).mean()
-                    
-                    # Calculate RSI
-                    delta = data['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                    rs = gain / loss
-                    data['RSI'] = 100 - (100 / (1 + rs))
-                    
-                    # Calculate MACD
-                    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-                    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-                    data['MACD'] = exp1 - exp2
-                    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-                    
-                    # Test LLM connection if selected
-                    if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
-                        is_available = test_ollama_connection(model_type)
-                        if not is_available:
-                            st.warning(f"{model_type} not available. Falling back to Random Forest model...")
-                            model_type = "Random Forest"
-                    
-                    # Generate predictions
-                    if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
-                        # Use LLM prediction
-                        prediction_data = {
-                            'ticker': ticker,
-                            'current_price': current_price,
-                            'ma20': float(data['MA20'].iloc[-1]),
-                            'ma50': float(data['MA50'].iloc[-1]),
-                            'ma200': float(data['MA200'].iloc[-1]),
-                            'rsi': float(data['RSI'].iloc[-1]),
-                            'volume': float(data['Volume'].iloc[-1]),
-                            'prediction_days': prediction_days
-                        }
-                        
-                        predictions = predict_stock_price(prediction_data, model_type)
-                        
-                        if predictions:
-                            # Display LLM prediction results
-                            st.subheader("Price Prediction")
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric(
-                                    "Direction",
-                                    predictions.get('direction', 'UNKNOWN'),
-                                    delta="↑" if predictions.get('direction') == "UP" else "↓"
-                                )
-                            
-                            with col2:
-                                change = float(predictions.get('percent_change', 0))
-                                st.metric(
-                                    "Expected Change",
-                                    f"{change:+.2f}%",
-                                    delta=change,
-                                    delta_color="normal"
-                                )
-                            
-                            with col3:
-                                confidence = float(predictions.get('confidence', 0))
-                                st.metric(
-                                    "Confidence",
-                                    f"{confidence:.1f}%"
-                                )
-                            
-                            # Calculate price targets
-                            predicted_change = float(predictions.get('percent_change', 0)) / 100
-                            predicted_price = current_price * (1 + predicted_change)
-                            
-                            # Display price predictions
-                            st.subheader("Price Targets")
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                lower_bound = predicted_price * 0.95
-                                st.metric(
-                                    "Conservative Target",
-                                    f"${lower_bound:.2f}",
-                                    delta=f"{((lower_bound/current_price - 1) * 100):.1f}%",
-                                    delta_color="inverse"
-                                )
-                            
-                            with col2:
-                                st.metric(
-                                    "Base Target",
-                                    f"${predicted_price:.2f}",
-                                    delta=f"{((predicted_price/current_price - 1) * 100):.1f}%",
-                                    delta_color="normal"
-                                )
-                            
-                            with col3:
-                                upper_bound = predicted_price * 1.05
-                                st.metric(
-                                    "Optimistic Target",
-                                    f"${upper_bound:.2f}",
-                                    delta=f"{((upper_bound/current_price - 1) * 100):.1f}%",
-                                    delta_color="normal"
-                                )
-                    else:
-                        # Use traditional ML models
-                        predictions = predict_stock_price(data, prediction_days, model_type)
-                        if predictions is not None:
-                            plot_predictions(data, predictions)
-                            
-                            # Show prediction summary
-                            last_price = data['Close'].iloc[-1]
-                            pred_price = predictions[-1]
-                            price_change = ((pred_price - last_price) / last_price) * 100
-                            
-                            st.subheader("Price Prediction")
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.metric(
-                                    "Current Price",
-                                    f"${last_price:.2f}"
-                                )
-                            
-                            with col2:
-                                st.metric(
-                                    f"Predicted Price ({prediction_days} days)",
-                                    f"${pred_price:.2f}",
-                                    delta=f"{price_change:+.2f}%",
-                                    delta_color="normal" if price_change > 0 else "inverse"
-                                )
-                    
-                    # Display technical analysis
-                    st.subheader("Technical Indicators")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        ma_signal = "Bullish" if data['MA20'].iloc[-1] > data['MA50'].iloc[-1] else "Bearish"
-                        st.metric(
-                            "Moving Average Signal",
-                            ma_signal,
-                            delta="↑" if ma_signal == "Bullish" else "↓"
-                        )
-                    
-                    with col2:
-                        rsi = data['RSI'].iloc[-1]
-                        rsi_signal = "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral"
-                        st.metric(
-                            "RSI Signal",
-                            f"{rsi:.1f}",
-                            delta=rsi_signal
-                        )
-                    
-                    with col3:
-                        volume_change = ((data['Volume'].iloc[-1] / data['Volume'].iloc[-2]) - 1) * 100
-                        st.metric(
-                            "Volume Change",
-                            f"{volume_change:+.1f}%",
-                            delta="Higher" if volume_change > 0 else "Lower"
-                        )
-                
-                except Exception as e:
-                    st.error(f"Error in prediction: {str(e)}")
-                    st.info("Please verify the ticker symbol and try again.")
-    
-    except Exception as e:
-        st.error(f"Error in prediction tab: {str(e)}")
-        st.info("Please refresh the page and try again.")
 
 def get_stock_data(ticker):
     """Get stock data with technical indicators"""
@@ -490,7 +260,7 @@ def get_stock_data(ticker):
         data['Volatility'] = data['Returns'].rolling(window=20).std()
         
         # Fill NaN values
-        data = data.fillna(method='bfill')
+        data = data.ffill().bfill()
         
         # Add ticker attribute
         data.attrs['ticker'] = ticker
@@ -1030,7 +800,7 @@ def get_buffett_writeup(ticker, metrics):
         sell_price = fair_value * 1.2  # 20% premium
         stop_loss = current_price * 0.85  # 15% below current
         
-        margin_of_safety = ((fair_value - current_price) / fair_value) * 100
+        margin_of_safety = safe_divide((fair_value - current_price), fair_value) * 100 if fair_value > 0 else -100
         
         # Assess competitive advantages
         moat_strength = "Strong" if operating_margin > 20 and roe > 15 else \
@@ -1258,8 +1028,8 @@ def buffett_analysis_tab():
                     # Update layout
                     fig.update_layout(
                         title=f"{ticker} - Technical Analysis",
-                        yaxis_title="Price",
-                        xaxis_title="Date",
+                        yaxis_title='Price',
+                        xaxis_title='Date',
                         height=600
                     )
                     
@@ -1301,7 +1071,6 @@ def buffett_analysis_tab():
                     
     except Exception as e:
         st.error(f"Error in Buffett analysis tab: {str(e)}")
-        st.info("Please verify the ticker symbol and try again.")
 
 def get_analyst_writeup(ticker, model_type="Ollama 3.2"):
     """Get detailed analyst writeup for a stock using LLM"""
@@ -2019,6 +1788,337 @@ def technical_analysis_tab():
     except Exception as e:
         st.error(f"Error in technical analysis tab: {str(e)}")
 
+def prediction_tab():
+    """Stock price prediction tab"""
+    try:
+        st.header("🔮 Stock Price Prediction")
+        
+        # Get user input
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="prediction_ticker").upper()
+        
+        # Model selection
+        model_type = st.selectbox(
+            "Select Model",
+            ["Random Forest", "XGBoost", "LightGBM", "Ollama 3.2", "DeepSeek-R1"],
+            help="Choose the model for prediction",
+            key="prediction_model"
+        )
+        
+        # Prediction days
+        prediction_days = st.slider(
+            "Prediction Days",
+            min_value=1,
+            max_value=30,
+            value=7,
+            help="Number of days to predict into the future",
+            key="prediction_days"
+        )
+        
+        # Model information
+        with st.expander("Model Information"):
+            st.write("""
+            **Available Models:**
+            - **Random Forest**: Ensemble method, good for stable predictions
+            - **XGBoost**: Gradient boosting, excellent for capturing trends
+            - **LightGBM**: Fast gradient boosting, good for large datasets
+            - **Ollama 3.2**: Advanced LLM for market analysis and predictions
+            - **DeepSeek-R1**: Specialized LLM for financial forecasting
+            """)
+        
+        if st.button("Generate Prediction", key="generate_prediction"):
+            with st.spinner("Fetching data and generating prediction..."):
+                try:
+                    # Get stock data safely
+                    stock = yf.Ticker(ticker)
+                    
+                    # Get historical data for technical analysis
+                    data = stock.history(period="2y")  # Get 2 years of data for better prediction
+                    if data.empty:
+                        st.error(f"No data found for {ticker}")
+                        return
+                    
+                    # Get current price
+                    current_price = data['Close'].iloc[-1] if not data.empty else None
+                    if current_price is None:
+                        st.error(f"Could not get current price for {ticker}")
+                        return
+                    
+                    # Process technical indicators
+                    data['MA20'] = data['Close'].rolling(window=20).mean()
+                    data['MA50'] = data['Close'].rolling(window=50).mean()
+                    data['MA200'] = data['Close'].rolling(window=200).mean()
+                    
+                    # Calculate RSI
+                    delta = data['Close'].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    rs = gain / loss
+                    data['RSI'] = 100 - (100 / (1 + rs))
+                    
+                    # Calculate MACD
+                    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+                    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+                    data['MACD'] = exp1 - exp2
+                    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+                    
+                    # Fill NaN values
+                    data = data.ffill().bfill()
+                    
+                    # Generate predictions
+                    result = predict_stock_price(data, prediction_days, model_type)
+                    
+                    if result is None:
+                        st.error("Failed to generate predictions. Please try again.")
+                        return
+                    
+                    # Unpack predictions
+                    future_pred, test_pred, confidence = result
+                    
+                    # Create future dates
+                    future_dates = []
+                    current_date = data.index[-1]
+                    
+                    # Generate exactly prediction_days business days
+                    while len(future_dates) < len(future_pred):
+                        current_date = current_date + pd.Timedelta(days=1)
+                        if current_date.weekday() < 5:  # Monday = 0, Friday = 4
+                            future_dates.append(current_date)
+                    
+                    # Create prediction DataFrame
+                    pred_df = pd.DataFrame({
+                        'Predicted': future_pred
+                    }, index=future_dates)
+                    
+                    # Add confidence bands if available
+                    if confidence is not None:
+                        lower_bound, upper_bound = confidence
+                        pred_df['Lower'] = lower_bound
+                        pred_df['Upper'] = upper_bound
+                    
+                    # Plot predictions
+                    fig = go.Figure()
+                    
+                    # Plot historical data (last 60 days)
+                    historical_data = data.tail(60)
+                    fig.add_trace(go.Scatter(
+                        x=historical_data.index,
+                        y=historical_data['Close'],
+                        name='Historical Price',
+                        line=dict(color='blue')
+                    ))
+                    
+                    # Plot predictions
+                    fig.add_trace(go.Scatter(
+                        x=pred_df.index,
+                        y=pred_df['Predicted'],
+                        name='Predicted Price',
+                        line=dict(color='red', dash='dash')
+                    ))
+                    
+                    # Add confidence bands
+                    if confidence is not None:
+                        fig.add_trace(go.Scatter(
+                            x=pred_df.index,
+                            y=pred_df['Lower'],
+                            name='Lower Bound',
+                            line=dict(color='gray', dash='dot'),
+                            showlegend=False
+                        ))
+                        
+                        fig.add_trace(go.Scatter(
+                            x=pred_df.index,
+                            y=pred_df['Upper'],
+                            name='Upper Bound',
+                            fill='tonexty',
+                            fillcolor='rgba(128, 128, 128, 0.2)',
+                            line=dict(color='gray', dash='dot'),
+                            showlegend=False
+                        ))
+                    
+                    # Update layout
+                    fig.update_layout(
+                        title=f'{ticker} Stock Price Prediction',
+                        yaxis_title='Stock Price (USD)',
+                        xaxis_title='Date',
+                        hovermode='x unified',
+                        showlegend=True
+                    )
+                    
+                    # Display plot
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Display prediction summary
+                    st.subheader("Prediction Summary")
+                    st.dataframe(pred_df.round(2))
+                    
+                    # Calculate key metrics
+                    current_price = data['Close'].iloc[-1]
+                    final_pred = pred_df['Predicted'].iloc[-1]
+                    price_change = ((final_pred - current_price) / current_price) * 100
+                    
+                    # Get technical signals
+                    rsi = data['RSI'].iloc[-1]
+                    macd_val = data['MACD'].iloc[-1]
+                    ma20 = data['MA20'].iloc[-1]
+                    ma50 = data['Close'].rolling(window=50).mean().iloc[-1]
+                    volume_trend = data['Volume'].tail(5).mean() / data['Volume'].tail(20).mean()
+                    
+                    # Determine market sentiment
+                    sentiment = "Bullish" if price_change > 0 else "Bearish"
+                    if abs(price_change) < 1:
+                        sentiment = "Neutral"
+                    
+                    # Generate analyst summary
+                    st.subheader("Wall Street Analyst Summary")
+                    with st.expander("View Detailed Analysis", expanded=True):
+                        # Price Analysis
+                        st.markdown(f"""
+                        ### Price Target Analysis
+                        **Current Price:** ${current_price:.2f}
+                        **Target Price ({prediction_days}-day):** ${final_pred:.2f} ({price_change:+.2f}%)
+                        
+                        ### Market Sentiment: {sentiment.upper()}
+                        
+                        **Key Drivers:**
+                        1. **Technical Indicators**
+                           - RSI: {rsi:.1f} ({'Overbought' if rsi > 70 else 'Oversold' if rsi < 30 else 'Neutral'})
+                           - MACD: {macd_val:.2f} ({'Positive' if macd_val > 0 else 'Negative'} momentum)
+                           - MA20/MA50: {'Bullish' if ma20 > ma50 else 'Bearish'} crossover
+                           - Volume Trend: {volume_trend:.2f}x average ({'+' if volume_trend > 1 else '-'}{abs(volume_trend-1)*100:.1f}% vs 20-day avg)
+                        
+                        2. **Price Action**
+                           - {'Upward' if price_change > 0 else 'Downward'} trajectory expected
+                           - {'Strong' if abs(price_change) > 5 else 'Moderate' if abs(price_change) > 2 else 'Mild'} momentum
+                           - Volatility: {'High' if pred_df['Upper'].iloc[-1] - pred_df['Lower'].iloc[-1] > current_price * 0.05 else 'Moderate' if pred_df['Upper'].iloc[-1] - pred_df['Lower'].iloc[-1] > current_price * 0.02 else 'Low'}
+                        
+                        ### Investment Thesis
+                        {ticker} shows {'promising upside potential' if price_change > 2 else 'concerning downside risk' if price_change < -2 else 'stable price action'} over the next {prediction_days} trading days. 
+                        {'The stock exhibits strong technical momentum with oversold conditions suggesting a potential reversal.' if rsi < 30 and price_change > 0 else 'Technical indicators suggest overbought conditions, warranting caution.' if rsi > 70 and price_change < 0 else 'Technical indicators are showing mixed signals.'} 
+                        Volume analysis indicates {'strong' if volume_trend > 1.2 else 'moderate' if volume_trend > 0.8 else 'weak'} market participation.
+                        
+                        ### Risk Assessment
+                        - **Upside Case:** ${pred_df['Upper'].iloc[-1]:.2f} (+{((pred_df['Upper'].iloc[-1] - current_price) / current_price * 100):.1f}%)
+                        - **Downside Case:** ${pred_df['Lower'].iloc[-1]:.2f} ({((pred_df['Lower'].iloc[-1] - current_price) / current_price * 100):+.1f}%)
+                        
+                        ### Trading Recommendation
+                        {'**STRONG BUY**' if price_change > 5 and rsi < 60 and volume_trend > 1 
+                         else '**BUY**' if price_change > 2 and rsi < 70 
+                         else '**HOLD**' if abs(price_change) <= 2 
+                         else '**SELL**' if price_change < -2 
+                         else '**STRONG SELL**'}
+                        
+                        *Note: This analysis is based on technical indicators and historical price patterns. Always conduct thorough fundamental analysis before making investment decisions.*
+                        """)
+                    
+                    # Generate investor letter
+                    st.subheader("Letter to Investors")
+                    with st.expander("View Investor Letter", expanded=True):
+                        # Get additional metrics
+                        avg_volume = data['Volume'].mean()
+                        volatility = data['Close'].pct_change().std() * 100
+                        support_level = min(data['Close'].tail(20).min(), pred_df['Lower'].min())
+                        resistance_level = max(data['Close'].tail(20).max(), pred_df['Upper'].max())
+                        risk_reward = abs((pred_df['Upper'].iloc[-1] - current_price) / (current_price - pred_df['Lower'].iloc[-1]))
+                        
+                        st.markdown(f"""
+                        Dear Valued Investors,
+                        
+                        I hope this letter finds you well. I am writing to share our latest analysis and outlook for {ticker}. As stewards of analytical insight, we believe in providing you with a clear and comprehensive view of the investment landscape.
+                        
+                        **Current Market Position**
+                        As of {pd.Timestamp.now().strftime('%B %d, %Y')}, {ticker} is trading at ${current_price:.2f}. Our analysis suggests a {prediction_days}-day target price of ${final_pred:.2f}, representing a {price_change:+.2f}% potential movement from current levels.
+                        
+                        **Key Investment Metrics**
+                        - Support Level: ${support_level:.2f}
+                        - Resistance Level: ${resistance_level:.2f}
+                        - Risk/Reward Ratio: {risk_reward:.2f}
+                        - 30-Day Volatility: {volatility:.1f}%
+                        - Average Daily Volume: {avg_volume:,.0f} shares
+                        
+                        **Technical Position**
+                        The stock's technical indicators present a {sentiment.lower()} outlook:
+                        - Relative Strength Index (RSI) at {rsi:.1f} indicates {'oversold conditions with potential upside' if rsi < 30 else 'overbought conditions suggesting caution' if rsi > 70 else 'neutral momentum'}
+                        - Moving averages show a {'bullish' if ma20 > ma50 else 'bearish'} trend
+                        - Volume trends are {'significantly above' if volume_trend > 1.2 else 'slightly above' if volume_trend > 0.8 else 'below'} historical averages
+                        
+                        **Investment Strategy**
+                        Based on our comprehensive analysis, we recommend the following strategy:
+                        
+                        1. Entry Points:
+                           - Aggressive Entry: ${pred_df['Lower'].iloc[0]:.2f}
+                           - Conservative Entry: ${(pred_df['Lower'].iloc[0] + current_price) / 2:.2f}
+                        
+                        2. Exit Targets:
+                           - Initial Target: ${pred_df['Predicted'].iloc[-1]:.2f}
+                           - Stretch Target: ${pred_df['Upper'].iloc[-1]:.2f}
+                        
+                        3. Risk Management:
+                           - Stop Loss: ${pred_df['Lower'].iloc[-1]:.2f}
+                           - Position Sizing: {'Moderate' if volatility > 2 else 'Conservative' if volatility > 3 else 'Aggressive'}
+                        
+                        **Market Outlook**
+                        {'The current technical setup suggests a favorable risk-reward ratio for initiating or adding to positions.' if price_change > 0 and rsi < 60 else 'Current market conditions suggest a cautious approach and reduced position sizes.' if price_change < 0 or rsi > 70 else 'The market presents a balanced opportunity for strategic position building.'}
+                        
+                        **Risk Considerations**
+                        While our analysis points to {'favorable' if price_change > 0 else 'challenging'} price action in the coming {prediction_days} days, investors should be mindful of:
+                        1. The inherent volatility ({volatility:.1f}% over 30 days)
+                        2. {'Overbought conditions' if rsi > 70 else 'Oversold conditions' if rsi < 30 else 'Current market momentum'}
+                        3. {'Above' if volume_trend > 1 else 'Below'}-average trading volumes
+                        
+                        **Conclusion**
+                        {'We see compelling value at current levels with a favorable risk-reward setup.' if price_change > 2 and rsi < 60 else 'Current prices suggest caution and strategic positioning.' if abs(price_change) <= 2 else 'We recommend reducing exposure at current levels.'} Our target price range of ${pred_df['Lower'].iloc[-1]:.2f} to ${pred_df['Upper'].iloc[-1]:.2f} provides a framework for disciplined investment decisions.
+                        
+                        Remember that successful investing requires patience, discipline, and a long-term perspective. We will continue to monitor the situation and provide updates as market conditions evolve.
+                        
+                        Best regards,
+                        StockPro Investment Team
+                        
+                        *Disclaimer: This analysis is based on technical indicators and historical patterns. Past performance does not guarantee future results. Always conduct your own due diligence and consider your investment objectives and risk tolerance.*
+                        """)
+                    
+                    # Display technical analysis
+                    st.subheader("Technical Indicators")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        ma_signal = "Bullish" if data['MA20'].iloc[-1] > data['MA50'].iloc[-1] else "Bearish"
+                        st.metric(
+                            "Moving Average Signal",
+                            ma_signal,
+                            delta="↑" if ma_signal == "Bullish" else "↓"
+                        )
+                    
+                    with col2:
+                        rsi = data['RSI'].iloc[-1]
+                        rsi_signal = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+                        st.metric(
+                            "RSI Signal",
+                            f"{rsi:.1f}",
+                            rsi_signal
+                        )
+                    
+                    with col3:
+                        macd = data['MACD'].iloc[-1]
+                        signal = data['Signal'].iloc[-1]
+                        macd_signal = "Bullish" if macd > signal else "Bearish"
+                        st.metric(
+                            "MACD Signal",
+                            macd_signal,
+                            delta="↑" if macd_signal == "Bullish" else "↓"
+                        )
+                
+                except Exception as e:
+                    st.error(f"Error analyzing {ticker}: {str(e)}")
+                    logger.error(f"Error in prediction tab: {str(e)}")
+                    logger.error(traceback.format_exc())
+    
+    except Exception as e:
+        st.error(f"Error in prediction tab: {str(e)}")
+        logger.error(f"Error in prediction tab: {str(e)}")
+        logger.error(traceback.format_exc())
+
 def calculate_rsi(data, periods=14):
     """Calculate Relative Strength Index"""
     try:
@@ -2056,26 +2156,25 @@ def calculate_rsi(data, periods=14):
 def calculate_macd(data, fast_period=12, slow_period=26, signal_period=9):
     """Calculate MACD (Moving Average Convergence Divergence)"""
     try:
-        # Convert data to Series if it's not already
         if isinstance(data, pd.DataFrame):
             close_prices = data['Close']
         else:
             close_prices = pd.Series(data)
             
         # Calculate EMAs
-        fast_ema = close_prices.ewm(span=fast_period, min_periods=fast_period).mean()
-        slow_ema = close_prices.ewm(span=slow_period, min_periods=slow_period).mean()
+        exp1 = close_prices.ewm(span=fast_period, adjust=False).mean()
+        exp2 = close_prices.ewm(span=slow_period, adjust=False).mean()
         
         # Calculate MACD line
-        macd = fast_ema - slow_ema
+        macd = exp1 - exp2
         
         # Calculate signal line
-        signal = macd.ewm(span=signal_period, min_periods=signal_period).mean()
+        signal = macd.ewm(span=signal_period, adjust=False).mean()
         
         # Calculate histogram
         hist = macd - signal
         
-        return macd, signal, hist
+        return macd.iloc[-signal_period:], signal.iloc[-signal_period:], hist.iloc[-signal_period:]
         
     except Exception as e:
         st.error(f"Error calculating MACD: {str(e)}")
@@ -2127,6 +2226,392 @@ def get_shareholder_letter(ticker, metrics):
     except Exception as e:
         return f"Error generating shareholder letter: {str(e)}"
 
+def company_profile_tab():
+    """Display company profile and key metrics"""
+    try:
+        st.header("📊 Company Profile")
+        
+        # Get user input
+        ticker = st.text_input("Enter Stock Ticker:", "AAPL", key="profile_ticker").upper()
+        
+        if ticker:
+            with st.spinner("Loading company data..."):
+                try:
+                    # Get stock data
+                    stock = yf.Ticker(ticker)
+                    info = stock.info
+                    
+                    if not info:
+                        st.error(f"No data found for {ticker}")
+                        return
+                    
+                    # Company Overview
+                    st.subheader("Company Overview")
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        # Company name and description
+                        st.markdown(f"### {info.get('longName', ticker)}")
+                        st.markdown(f"**Sector:** {info.get('sector', 'N/A')} | **Industry:** {info.get('industry', 'N/A')}")
+                        st.markdown(f"**Website:** [{info.get('website', 'N/A')}]({info.get('website', '#')})")
+                        st.markdown("### Business Summary")
+                        st.write(info.get('longBusinessSummary', 'No description available.'))
+                    
+                    with col2:
+                        # Key Stats
+                        st.markdown("### Key Statistics")
+                        market_cap = info.get('marketCap', 0)
+                        st.metric("Market Cap", f"${market_cap:,.0f}" if isinstance(market_cap, (int, float)) and market_cap > 0 else "N/A")
+                        
+                        pe_ratio = info.get('trailingPE')
+                        st.metric("P/E Ratio", f"{pe_ratio:.2f}" if isinstance(pe_ratio, (int, float)) else "N/A")
+                        
+                        beta = info.get('beta')
+                        st.metric("Beta", f"{beta:.2f}" if isinstance(beta, (int, float)) else "N/A")
+                        
+                        high_52w = info.get('fiftyTwoWeekHigh')
+                        st.metric("52W High", f"${high_52w:.2f}" if isinstance(high_52w, (int, float)) else "N/A")
+                        
+                        low_52w = info.get('fiftyTwoWeekLow')
+                        st.metric("52W Low", f"${low_52w:.2f}" if isinstance(low_52w, (int, float)) else "N/A")
+                    
+                    # Financial Metrics
+                    st.subheader("Financial Metrics")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown("### Valuation")
+                        forward_pe = info.get('forwardPE')
+                        st.metric("Forward P/E", f"{forward_pe:.2f}" if isinstance(forward_pe, (int, float)) else "N/A")
+                        
+                        peg_ratio = info.get('pegRatio')
+                        st.metric("PEG Ratio", f"{peg_ratio:.2f}" if isinstance(peg_ratio, (int, float)) else "N/A")
+                        
+                        pb_ratio = info.get('priceToBook')
+                        st.metric("Price/Book", f"{pb_ratio:.2f}" if isinstance(pb_ratio, (int, float)) else "N/A")
+                        
+                        ps_ratio = info.get('priceToSalesTrailing12Months')
+                        st.metric("Price/Sales", f"{ps_ratio:.2f}" if isinstance(ps_ratio, (int, float)) else "N/A")
+                    
+                    with col2:
+                        st.markdown("### Growth & Margins")
+                        rev_growth = info.get('revenueGrowth')
+                        st.metric("Revenue Growth", f"{rev_growth*100:.1f}%" if isinstance(rev_growth, (int, float)) else "N/A")
+                        
+                        gross_margin = info.get('grossMargins')
+                        st.metric("Gross Margin", f"{gross_margin*100:.1f}%" if isinstance(gross_margin, (int, float)) else "N/A")
+                        
+                        op_margin = info.get('operatingMargins')
+                        st.metric("Operating Margin", f"{op_margin*100:.1f}%" if isinstance(op_margin, (int, float)) else "N/A")
+                        
+                        profit_margin = info.get('profitMargins')
+                        st.metric("Profit Margin", f"{profit_margin*100:.1f}%" if isinstance(profit_margin, (int, float)) else "N/A")
+                    
+                    with col3:
+                        st.markdown("### Dividends & Returns")
+                        div_yield = info.get('dividendYield')
+                        st.metric("Dividend Yield", f"{div_yield*100:.2f}%" if isinstance(div_yield, (int, float)) else "N/A")
+                        
+                        roe = info.get('returnOnEquity')
+                        st.metric("ROE", f"{roe*100:.1f}%" if isinstance(roe, (int, float)) else "N/A")
+                        
+                        roa = info.get('returnOnAssets')
+                        st.metric("ROA", f"{roa*100:.1f}%" if isinstance(roa, (int, float)) else "N/A")
+                        
+                        payout_ratio = info.get('payoutRatio')
+                        st.metric("Payout Ratio", f"{payout_ratio*100:.1f}%" if isinstance(payout_ratio, (int, float)) else "N/A")
+                    
+                    # Financial Reports Links
+                    st.subheader("Financial Reports & Resources")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("### SEC Filings")
+                        sec_url = f"https://www.sec.gov/cgi-bin/browse-edgar?CIK={info.get('SEC_CIK', '')}&owner=exclude"
+                        st.markdown(f"[View SEC Filings]({sec_url})")
+                        
+                        # Yahoo Finance links
+                        base_url = f"https://finance.yahoo.com/quote/{ticker}"
+                        st.markdown(f"[Income Statement]({base_url}/financials)")
+                        st.markdown(f"[Balance Sheet]({base_url}/balance-sheet)")
+                        st.markdown(f"[Cash Flow]({base_url}/cash-flow)")
+                    
+                    with col2:
+                        st.markdown("### Investor Resources")
+                        st.markdown(f"[Earnings Calls Transcripts](https://seekingalpha.com/symbol/{ticker}/earnings)")
+                        st.markdown(f"[Latest News](https://finance.yahoo.com/quote/{ticker}/news)")
+                        ir_website = info.get('website', '').rstrip('/') + '/investor-relations'
+                        st.markdown(f"[Investor Relations]({ir_website})")
+                    
+                    # Ownership and Insiders
+                    st.subheader("Ownership Information")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("### Institutional Ownership")
+                        try:
+                            inst_holders = stock.institutional_holders
+                            if isinstance(inst_holders, pd.DataFrame) and not inst_holders.empty:
+                                st.dataframe(inst_holders.head())
+                            else:
+                                st.write("No institutional ownership data available")
+                        except Exception as e:
+                            st.write("No institutional ownership data available")
+                    
+                    with col2:
+                        st.markdown("### Major Holders")
+                        try:
+                            major_holders = stock.major_holders
+                            if isinstance(major_holders, pd.DataFrame) and not major_holders.empty:
+                                st.dataframe(major_holders)
+                            else:
+                                st.write("No major holders data available")
+                        except Exception as e:
+                            st.write("No major holders data available")
+                    
+                except Exception as e:
+                    st.error(f"Error loading company data: {str(e)}")
+                    logger.error(f"Error in company profile tab: {str(e)}")
+                    logger.error(traceback.format_exc())
+    
+    except Exception as e:
+        st.error(f"Error in company profile tab: {str(e)}")
+        logger.error(f"Error in company profile tab: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def get_options_chain(ticker):
+    """Fetch options chain data for a given ticker"""
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = stock.options
+        
+        if not expirations:
+            return None, None, None
+            
+        # Get the nearest expiration date
+        expiry = expirations[0]
+        calls = stock.option_chain(expiry).calls
+        puts = stock.option_chain(expiry).puts
+        
+        # Clean and format the data
+        calls = calls[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
+        puts = puts[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']]
+        
+        # Calculate mid price
+        calls['midPrice'] = (calls['bid'] + calls['ask']) / 2
+        puts['midPrice'] = (puts['bid'] + puts['ask']) / 2
+        
+        # Format implied volatility
+        calls['impliedVolatility'] = calls['impliedVolatility'] * 100
+        puts['impliedVolatility'] = puts['impliedVolatility'] * 100
+        
+        return calls, puts, expiry
+    except Exception as e:
+        st.error(f"Error fetching options data: {str(e)}")
+        return None, None, None
+
+def get_options_strategy(ticker, price, rsi, volatility):
+    """Determine the best options strategy based on technical indicators"""
+    strategy = {
+        'name': '',
+        'description': '',
+        'risk_level': '',
+        'potential_return': '',
+        'max_loss': '',
+        'break_even': '',
+        'outlook': ''
+    }
+    
+    # High volatility strategies
+    if volatility > 0.3:
+        if rsi > 70:  # Overbought
+            strategy.update({
+                'name': 'Put Credit Spread',
+                'description': 'Sell a put option and buy a lower strike put option',
+                'risk_level': 'Moderate',
+                'outlook': 'Slightly Bearish to Neutral',
+                'potential_return': 'Premium received',
+                'max_loss': 'Difference between strikes - premium received'
+            })
+        elif rsi < 30:  # Oversold
+            strategy.update({
+                'name': 'Call Credit Spread',
+                'description': 'Sell a call option and buy a higher strike call option',
+                'risk_level': 'Moderate',
+                'outlook': 'Slightly Bullish to Neutral',
+                'potential_return': 'Premium received',
+                'max_loss': 'Difference between strikes - premium received'
+            })
+        else:  # Neutral
+            strategy.update({
+                'name': 'Iron Condor',
+                'description': 'Sell both a put and call credit spread',
+                'risk_level': 'Moderate',
+                'outlook': 'Neutral',
+                'potential_return': 'Premium received from both spreads',
+                'max_loss': 'Larger of the two spread differences - total premium received'
+            })
+    
+    # Low volatility strategies
+    else:
+        if rsi > 70:  # Overbought
+            strategy.update({
+                'name': 'Protective Put',
+                'description': 'Buy puts to protect long stock position',
+                'risk_level': 'Low',
+                'outlook': 'Bearish hedge',
+                'potential_return': 'Unlimited upside with downside protection',
+                'max_loss': 'Premium paid'
+            })
+        elif rsi < 30:  # Oversold
+            strategy.update({
+                'name': 'Long Call',
+                'description': 'Buy call options for upside potential',
+                'risk_level': 'High',
+                'outlook': 'Bullish',
+                'potential_return': 'Unlimited',
+                'max_loss': 'Premium paid'
+            })
+        else:  # Neutral
+            strategy.update({
+                'name': 'Covered Call',
+                'description': 'Sell calls against long stock position',
+                'risk_level': 'Low',
+                'outlook': 'Neutral to Slightly Bullish',
+                'potential_return': 'Premium received + potential stock appreciation',
+                'max_loss': 'Stock price - premium received'
+            })
+    
+    return strategy
+
+def highlight_options(df, current_price, is_calls=True):
+    """Highlight optimal entry/exit points in options chain"""
+    def color_row(row):
+        strike_diff = abs(row['strike'] - current_price)
+        volume_rank = row['volume'] / df['volume'].max()
+        iv_rank = row['impliedVolatility'] / df['impliedVolatility'].max()
+        
+        # For calls
+        if is_calls:
+            if row['strike'] < current_price and volume_rank > 0.7:  # ITM with high volume
+                return ['background-color: rgba(0, 255, 0, 0.1)'] * len(row)  # Light green
+            elif row['strike'] > current_price and iv_rank > 0.8:  # OTM with high IV
+                return ['background-color: rgba(255, 165, 0, 0.1)'] * len(row)  # Light orange
+        # For puts
+        else:
+            if row['strike'] > current_price and volume_rank > 0.7:  # ITM with high volume
+                return ['background-color: rgba(0, 255, 0, 0.1)'] * len(row)  # Light green
+            elif row['strike'] < current_price and iv_rank > 0.8:  # OTM with high IV
+                return ['background-color: rgba(255, 165, 0, 0.1)'] * len(row)  # Light orange
+        
+        return [''] * len(row)
+    
+    return df.style.apply(color_row, axis=1).format({
+        'strike': '${:.2f}',
+        'lastPrice': '${:.2f}',
+        'bid': '${:.2f}',
+        'ask': '${:.2f}',
+        'midPrice': '${:.2f}',
+        'impliedVolatility': '{:.1f}%',
+        'volume': '{:,.0f}',
+        'openInterest': '{:,.0f}'
+    })
+
+def options_analysis_tab(ticker, data):
+    """Display options analysis and trading strategies"""
+    st.subheader(f"Options Analysis - {ticker}")
+    
+    # Get current price and volatility
+    current_price = data['Close'].iloc[-1]
+    volatility = data['Close'].pct_change().std() * np.sqrt(252) * 100
+    rsi = calculate_rsi(data['Close'])[-1]
+    
+    # Fetch options data
+    calls, puts, expiry = get_options_chain(ticker)
+    
+    if calls is None or puts is None:
+        st.error("Unable to fetch options data")
+        return
+    
+    # Display market conditions and strategy
+    st.markdown(f"""
+    ### Market Conditions
+    - Current Price: ${current_price:.2f}
+    - Implied Volatility: {volatility:.1f}%
+    - RSI: {rsi:.1f}
+    
+    ### Options Chain Color Guide
+    🟢 **Green Rows:** High volume In-The-Money options (potential buying opportunities)  
+    🟡 **Orange Rows:** High IV Out-of-The-Money options (potential selling opportunities)
+    """)
+    
+    # Create tabs for calls and puts
+    call_tab, put_tab = st.tabs(["Call Options", "Put Options"])
+    
+    with call_tab:
+        st.subheader(f"Call Options (Expiry: {expiry})")
+        st.dataframe(highlight_options(calls, current_price, is_calls=True))
+        
+        # Plot implied volatility smile for calls
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=calls['strike'],
+            y=calls['impliedVolatility'],
+            mode='lines+markers',
+            name='IV Smile'
+        ))
+        fig.update_layout(
+            title='Call Options Implied Volatility Smile',
+            xaxis_title='Strike Price',
+            yaxis_title='Implied Volatility (%)'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with put_tab:
+        st.subheader(f"Put Options (Expiry: {expiry})")
+        st.dataframe(highlight_options(puts, current_price, is_calls=False))
+        
+        # Plot implied volatility smile for puts
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=puts['strike'],
+            y=puts['impliedVolatility'],
+            mode='lines+markers',
+            name='IV Smile'
+        ))
+        fig.update_layout(
+            title='Put Options Implied Volatility Smile',
+            xaxis_title='Strike Price',
+            yaxis_title='Implied Volatility (%)'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Options Education
+    with st.expander("Options Trading Guide", expanded=False):
+        st.markdown("""
+        ### Reading the Options Chain
+        
+        **Green Highlighted Rows:**
+        - In-The-Money (ITM) options with high trading volume
+        - Typically more liquid and easier to trade
+        - Better for buying strategies due to higher delta
+        
+        **Orange Highlighted Rows:**
+        - Out-of-The-Money (OTM) options with high implied volatility
+        - Potential premium selling opportunities
+        - Better for credit strategies when volatility is high
+        
+        **Key Metrics:**
+        - **Strike:** The price at which the option can be exercised
+        - **Bid/Ask:** The prices at which you can sell/buy the option
+        - **Volume:** Number of contracts traded today
+        - **Open Interest:** Total number of outstanding contracts
+        - **IV:** Implied Volatility, higher values mean more expensive options
+        
+        **Risk Warning:**
+        Options trading involves significant risk and is not suitable for all investors. Please ensure you understand these risks before trading.
+        """)
+
 def main():
     st.title("Stock Analysis App")
     
@@ -2136,13 +2621,15 @@ def main():
     
     # Create tabs
     chart_tabs = st.tabs([
-        "Daily Chart",
-        "Historical Charts",
+        "Company Profile",
+        "Technical Analysis",
         "Price Prediction",
         "Buffett Analysis",
         "Stock Recommendations",
         "Market Movers",
-        "Technical Analysis"
+        "Options Analysis",
+        "Daily Chart",
+        "Historical Charts"
     ])
     
     # Get stock ticker input (shared across tabs)
@@ -2166,27 +2653,13 @@ def main():
                 
             st.sidebar.success(f"Analyzing {ticker}: {info.get('longName', '')}")
             
-            # Daily Chart Tab
+            # Company Profile Tab
             with chart_tabs[0]:
-                chart = plot_daily_candlestick(ticker)
-                if chart is not None:
-                    st.plotly_chart(chart, use_container_width=True)
-                else:
-                    st.error(f"Unable to fetch daily chart data for {ticker}")
+                company_profile_tab()
             
-            # Historical Charts Tab
+            # Technical Analysis Tab
             with chart_tabs[1]:
-                st.subheader(f"Historical Price Charts - {ticker}")
-                period = st.selectbox(
-                    "Select Time Period",
-                    ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
-                    index=3
-                )
-                chart = plot_stock_history(ticker, period)
-                if chart is not None:
-                    st.plotly_chart(chart, use_container_width=True)
-                else:
-                    st.error(f"Unable to fetch historical data for {ticker}")
+                technical_analysis_tab()
             
             # Price Prediction Tab
             with chart_tabs[2]:
@@ -2204,9 +2677,23 @@ def main():
             with chart_tabs[5]:
                 market_movers_tab()
                 
-            # Technical Analysis Tab
+            # Options Analysis Tab
             with chart_tabs[6]:
-                technical_analysis_tab()
+                options_analysis_tab(ticker, stock.history(period="1y"))
+            
+            # Historical Charts Tab
+            with chart_tabs[7]:
+                st.subheader(f"Historical Price Charts - {ticker}")
+                period = st.selectbox(
+                    "Select Time Period",
+                    ["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"],
+                    index=3
+                )
+                chart = plot_stock_history(ticker, period)
+                if chart:
+                    st.plotly_chart(chart, use_container_width=True)
+                else:
+                    st.error(f"Unable to fetch historical data for {ticker}")
                 
         except Exception as e:
             st.sidebar.error(f"Error analyzing {ticker}: {str(e)}")

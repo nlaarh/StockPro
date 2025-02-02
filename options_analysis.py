@@ -4,8 +4,7 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from scipy.stats import percentileofscore
-from datetime import datetime
-
+from datetime import datetime, timedelta
 from utils import calculate_rsi, calculate_macd
 
 
@@ -53,6 +52,10 @@ def get_options_chain(ticker):
 def get_options_strategy(ticker, price, rsi, volatility):
     """Determine the best options strategy based on technical indicators"""
     try:
+        # Convert rsi to float if it's a Series
+        if isinstance(rsi, pd.Series):
+            rsi = float(rsi.iloc[-1])
+        
         strategy = {
             'name': None,
             'description': None,
@@ -93,24 +96,6 @@ def get_options_strategy(ticker, price, rsi, volatility):
     except Exception as e:
         st.error(f"Error determining options strategy: {str(e)}")
         return None
-
-
-def highlight_options(df, current_price, is_calls=True):
-    """Highlight optimal entry/exit points in options chain"""
-    # Implementation of options highlighting
-    pass
-
-
-def get_best_options(calls, puts, current_price, strategy, data=None):
-    """Get the best options to trade based on strategy and market conditions"""
-    # Implementation of best options selection
-    pass
-
-
-def analyze_market_conditions(data, current_price, volatility, rsi):
-    """Analyze market conditions for options strategy selection"""
-    # Implementation of market condition analysis
-    pass
 
 
 def get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy, calls, puts, expiration):
@@ -315,155 +300,10 @@ def get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy,
 
 def options_analysis_tab(ticker):
     """Display options analysis and trading strategies"""
+    st.write("Options Analysis")
+    
     try:
         st.subheader(f"Options Analysis for {ticker}")
-        
-        # Add investment essay
-        with st.expander("📚 Understanding Options Investment", expanded=True):
-            st.markdown("""
-            # A Guide to Options Investment
-            
-            Options trading represents a sophisticated approach to investing that can offer both enhanced returns and risk management capabilities. This comprehensive guide will help you understand the fundamentals and advanced concepts of options investing.
-            
-            ## What Are Options?
-            Options are financial derivatives that give buyers the right, but not the obligation, to buy (calls) or sell (puts) an underlying asset at a predetermined price within a specific time frame. They serve multiple purposes in a modern investment portfolio:
-            
-            1. **Income Generation**
-               - Writing covered calls for regular premium income
-               - Selling puts to acquire stocks at desired prices
-               - Creating structured income strategies
-            
-            2. **Risk Management**
-               - Hedging portfolio positions against market downturns
-               - Protecting unrealized gains in long positions
-               - Reducing portfolio volatility
-            
-            3. **Leverage and Capital Efficiency**
-               - Controlling more shares with less capital
-               - Amplifying returns on directional moves
-               - Implementing sophisticated spread strategies
-            
-            ## Key Components of Options
-            
-            ### 1. Strike Price
-            - The predetermined price at which the option can be exercised
-            - Determines if an option is In-The-Money (ITM) or Out-of-The-Money (OTM)
-            - Critical for strategy selection and risk/reward profiles
-            
-            ### 2. Expiration Date
-            - The deadline for exercising the option
-            - Affects time decay (theta) and option premium
-            - Shorter dates = faster time decay but lower cost
-            
-            ### 3. Implied Volatility (IV)
-            - Market's forecast of likely movement
-            - Higher IV = more expensive options
-            - Key for selecting optimal entry points
-            
-            ## Advanced Concepts
-            
-            ### 1. The Greeks
-            - **Delta**: Directional risk exposure
-            - **Theta**: Time decay impact
-            - **Vega**: Volatility sensitivity
-            - **Gamma**: Rate of delta change
-            
-            ### 2. Volatility Analysis
-            - Historical vs. Implied Volatility
-            - Volatility skew and term structure
-            - Mean reversion opportunities
-            
-            ## Risk Management Principles
-            
-            1. **Position Sizing**
-               - Never risk more than 2-3% on any single trade
-               - Consider portfolio correlation
-               - Account for maximum possible loss
-            
-            2. **Strategy Selection**
-               - Match strategies to market outlook
-               - Consider volatility environment
-               - Account for liquidity constraints
-            
-            3. **Exit Planning**
-               - Predefined profit targets
-               - Stop-loss levels
-               - Time-based exits
-            
-            ## Best Practices
-            
-            1. **Start Small**
-               - Begin with simple strategies
-               - Paper trade to gain experience
-               - Gradually increase complexity
-            
-            2. **Continuous Learning**
-               - Study market behavior
-               - Analyze past trades
-               - Stay informed about market conditions
-            
-            3. **Risk First**
-               - Focus on risk management
-               - Use defined-risk strategies
-               - Always know your maximum loss
-            
-            ## Common Pitfalls to Avoid
-            
-            1. **Overleverage**
-               - Don't use excessive position sizes
-               - Consider worst-case scenarios
-               - Maintain adequate cash reserves
-            
-            2. **Ignoring Volatility**
-               - Pay attention to IV levels
-               - Consider volatility mean reversion
-               - Adjust strategies based on IV environment
-            
-            3. **Poor Position Management**
-               - Don't let small losses become large
-               - Take profits when available
-               - Adjust positions when necessary
-            
-            ## Conclusion
-            
-            Options trading requires a disciplined approach combining technical analysis, risk management, and strategic thinking. Success comes from:
-            
-            - Understanding fundamental concepts
-            - Implementing proper risk management
-            - Maintaining emotional discipline
-            - Continuous education and improvement
-            
-            Remember that options trading involves substantial risk and is not suitable for all investors. Always consider your risk tolerance and investment objectives before implementing any strategy.
-            """)
-        
-        # Add strategy explanation section
-        with st.expander("ℹ️ Understanding Options Strategies"):
-            st.markdown("""
-            ### Options Trading Strategies Guide
-            
-            #### Key Concepts:
-            - **Call Options**: Right to buy stock at strike price
-            - **Put Options**: Right to sell stock at strike price
-            - **In-The-Money (ITM)**: Options with immediate exercise value (shown in 🟢)
-            - **Out-of-The-Money (OTM)**: Options with no immediate exercise value
-            
-            #### Common Strategies:
-            1. **Covered Call**
-               - Low risk, income generation
-               - Sell calls against owned stock
-            
-            2. **Put Credit Spread**
-               - Medium risk, defined risk/reward
-               - Profit from high volatility
-            
-            3. **Iron Condor**
-               - Medium risk, market neutral
-               - Profit from time decay
-            
-            4. **Long Call/Put**
-               - High risk, directional bet
-               - Maximum leverage
-            """)
         
         # Get stock data
         stock = yf.Ticker(ticker)
@@ -475,7 +315,13 @@ def options_analysis_tab(ticker):
         current_price = data['Close'].iloc[-1]
         
         # Calculate technical indicators
-        rsi = calculate_rsi(data)[-1]
+        rsi_data = calculate_rsi(data)
+        if rsi_data.empty:
+            st.warning("Could not calculate RSI. Using default values.")
+            rsi = 50  # Neutral RSI value
+        else:
+            rsi = float(rsi_data.iloc[-1].values[0])  # Extract scalar value properly
+            
         volatility = data['Close'].pct_change().std() * np.sqrt(252)  # Annualized volatility
         
         # Get options chain
@@ -505,7 +351,7 @@ def options_analysis_tab(ticker):
                     delta="High" if volatility > 0.3 else "Low",
                     delta_color="off")
             
-            # Display strategy recommendation with better formatting
+            # Display strategy recommendation
             st.markdown("### 📈 Strategy Recommendation")
             rec_col1, rec_col2 = st.columns([1, 2])
             
@@ -516,10 +362,10 @@ def options_analysis_tab(ticker):
             with rec_col2:
                 st.write(f"**Description:** {strategy['description']}")
             
-            # Display options chains with legend
+            # Display options chains
             st.markdown("### 📊 Options Chain Analysis")
             st.markdown("""
-            <small>🟢 In-The-Money (ITM) options are highlighted in green. These options have intrinsic value.</small>
+            <small>🟢 In-The-Money (ITM) options are highlighted in green.</small>
             """, unsafe_allow_html=True)
             
             tab1, tab2 = st.tabs(["📈 Calls", "📉 Puts"])
@@ -538,7 +384,7 @@ def options_analysis_tab(ticker):
                     axis=1
                 ))
             
-            # Display risk analysis with better formatting
+            # Display risk analysis
             st.markdown("### ⚠️ Risk Analysis")
             
             # Calculate days to nearest expiration
@@ -560,14 +406,17 @@ def options_analysis_tab(ticker):
                     delta=strategy['risk_level'],
                     delta_color="inverse")
             
-            # Display analyst letter with better formatting
-            st.markdown("### 📝 Options Strategy Analysis")
-            with st.expander("Click to read detailed options strategy analysis"):
+            # Display analyst letter
+            with st.expander("View Detailed Analyst Letter from CIO Nour Laaroubi"):
                 letter = get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy, calls, puts, expiration)
                 if letter:
                     st.markdown(letter)
-                
+                else:
+                    st.warning("Could not generate analyst letter")
+                    
     except Exception as e:
         st.error(f"Error in options analysis tab: {str(e)}")
         import traceback
         st.error(traceback.format_exc())
+
+st.write("Options Analysis")

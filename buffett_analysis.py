@@ -73,7 +73,6 @@ def get_buffett_metrics(ticker):
         info = stock.info
         
         metrics = {
-            'current_price': info.get('currentPrice', 0),
             'roe': safe_divide(info.get('returnOnEquity', 0), 1) * 100,
             'operating_margin': safe_divide(info.get('operatingMargins', 0), 1) * 100,
             'gross_margin': safe_divide(info.get('grossMargins', 0), 1) * 100,
@@ -211,23 +210,25 @@ def get_buffett_letter(ticker, metrics, info):
         logger.error(f"Error generating Buffett letter: {str(e)}")
         return None
 
-def buffett_analysis_tab():
+def buffett_analysis_tab(ticker, data, info):
     """Display Warren Buffett style analysis tab"""
     try:
         st.header(" Warren Buffett Analysis")
         
-        ticker = st.session_state.get('ticker', '')
         if not ticker:
             st.warning("Please enter a stock ticker in the sidebar.")
             return
             
         with st.spinner("Analyzing through Warren Buffett's lens..."):
             try:
-                # Get metrics and info
-                metrics, info = get_buffett_metrics(ticker)
-                if not metrics or not info:
+                # Get metrics
+                metrics, _ = get_buffett_metrics(ticker)
+                if not metrics:
                     st.error("Could not calculate Buffett metrics. Please try again later.")
                     return
+                
+                # Add current price from data
+                metrics['current_price'] = data['Close'].iloc[-1]
                 
                 # 1. Warren Buffett's Key Metrics Table
                 st.subheader(" Warren Buffett's Key Metrics")
@@ -295,8 +296,8 @@ def buffett_analysis_tab():
                 })
                 st.table(targets_df)
                 
-                # 3. Key Investment Takeaways
-                st.subheader(" Key Investment Takeaways")
+                # 3. Strengths and Concerns in Two Columns
+                st.subheader(" Investment Analysis")
                 
                 col1, col2 = st.columns(2)
                 
@@ -336,3 +337,128 @@ def buffett_analysis_tab():
     except Exception as e:
         st.error(f"Error in Buffett analysis tab: {str(e)}")
         logger.error(f"Error in Buffett analysis tab: {str(e)}")
+
+def display_analysis(ticker):
+    """Display Warren Buffett style analysis"""
+    try:
+        # Get stock data
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        data = stock.history(period="1y")
+        
+        if data.empty:
+            st.error(f"Could not fetch data for {ticker}")
+            return
+            
+        # Get metrics
+        metrics, _ = get_buffett_metrics(ticker)
+        if not metrics:
+            st.error("Could not calculate Buffett metrics. Please try again later.")
+            return
+            
+        # Add current price from data
+        metrics['current_price'] = data['Close'].iloc[-1]
+        
+        # 1. Warren Buffett's Key Metrics Table
+        st.subheader(" Warren Buffett's Key Metrics")
+        metrics_df = pd.DataFrame({
+            'Metric': [
+                'Return on Equity (ROE)',
+                'Operating Margin',
+                'Gross Margin',
+                'Debt to Equity',
+                'Current Ratio',
+                'Free Cash Flow Yield',
+                'P/E Ratio',
+                'Revenue Growth',
+                'Earnings Growth'
+            ],
+            'Value': [
+                f"{metrics['roe']:.1f}%",
+                f"{metrics['operating_margin']:.1f}%",
+                f"{metrics['gross_margin']:.1f}%",
+                f"{metrics['debt_to_equity']:.2f}",
+                f"{metrics['current_ratio']:.2f}",
+                f"{metrics['fcf_yield']:.1f}%",
+                f"{metrics['pe_ratio']:.2f}",
+                f"{metrics['revenue_growth']:.1f}%",
+                f"{metrics['earnings_growth']:.1f}%"
+            ],
+            'Buffett\'s Assessment': [
+                ' Excellent' if metrics['roe'] > 15 else ' Below Target',
+                ' Strong' if metrics['operating_margin'] > 20 else ' Needs Improvement',
+                ' Good' if metrics['gross_margin'] > 40 else ' Below Target',
+                ' Conservative' if metrics['debt_to_equity'] < 50 else ' High Leverage',
+                ' Strong' if metrics['current_ratio'] > 1.5 else ' Tight Liquidity',
+                ' Attractive' if metrics['fcf_yield'] > 5 else ' Low Yield',
+                ' Fair' if metrics['pe_ratio'] < 20 else ' Expensive',
+                ' Good' if metrics['revenue_growth'] > 10 else ' Slow Growth',
+                ' Strong' if metrics['earnings_growth'] > 10 else ' Weak Growth'
+            ]
+        })
+        st.table(metrics_df)
+        
+        # 2. Buy/Sell Price Recommendations with Visual Chart
+        st.subheader(" Investment Price Targets")
+        
+        # Display the price targets chart
+        fig = plot_price_targets(metrics['current_price'])
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Show detailed price targets table
+        targets_df = pd.DataFrame({
+            'Rating': ['Strong Buy', 'Buy', 'Hold', 'Sell', 'Strong Sell'],
+            'Price Range': [
+                f"Below ${metrics['current_price'] * 0.7:.2f}",
+                f"${metrics['current_price'] * 0.7:.2f} - ${metrics['current_price'] * 0.85:.2f}",
+                f"${metrics['current_price'] * 0.85:.2f} - ${metrics['current_price'] * 1.15:.2f}",
+                f"${metrics['current_price'] * 1.15:.2f} - ${metrics['current_price'] * 1.3:.2f}",
+                f"Above ${metrics['current_price'] * 1.3:.2f}"
+            ],
+            'Margin of Safety': [
+                '30%+ discount',
+                '15-30% discount',
+                '±15% of fair value',
+                '15-30% premium',
+                '30%+ premium'
+            ]
+        })
+        st.table(targets_df)
+        
+        # 3. Strengths and Concerns in Two Columns
+        st.subheader(" Investment Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Strengths**")
+            if metrics['roe'] > 15:
+                st.markdown(" Strong return on equity")
+            if metrics['operating_margin'] > 20:
+                st.markdown(" Excellent operating margins")
+            if metrics['debt_to_equity'] < 50:
+                st.markdown(" Conservative debt levels")
+            if metrics['fcf_yield'] > 5:
+                st.markdown(" Attractive free cash flow yield")
+        
+        with col2:
+            st.markdown("**Areas of Concern**")
+            if metrics['roe'] <= 15:
+                st.markdown(" Below-target ROE")
+            if metrics['operating_margin'] <= 20:
+                st.markdown(" Margin improvement needed")
+            if metrics['debt_to_equity'] >= 50:
+                st.markdown(" High leverage")
+            if metrics['fcf_yield'] <= 5:
+                st.markdown(" Low cash flow yield")
+        
+        # 4. Warren Buffett's Letter to Shareholders (Expandable)
+        st.subheader(" Warren Buffett's Letter to Shareholders")
+        with st.expander("Click to read Warren Buffett's detailed analysis"):
+            letter = get_buffett_letter(ticker, metrics, info)
+            if letter:
+                st.markdown(letter)
+                
+    except Exception as e:
+        st.error(f"Error in Buffett analysis: {str(e)}")
+        logger.error(f"Error in Buffett analysis: {str(e)}")

@@ -3,7 +3,49 @@ import pandas as pd
 import requests
 import ssl
 import certifi
+import logging
 
+logger = logging.getLogger(__name__)
+
+def format_number(value):
+    """Format numbers for display"""
+    try:
+        if pd.isna(value):
+            return "N/A"
+        if isinstance(value, str):
+            # Try to convert percentage strings
+            if '%' in value:
+                value = float(value.strip('%')) / 100
+            else:
+                value = float(value)
+        
+        if abs(value) >= 1e9:
+            return f"${value/1e9:.2f}B"
+        elif abs(value) >= 1e6:
+            return f"${value/1e6:.2f}M"
+        elif isinstance(value, float):
+            if abs(value) < 0.01:
+                return f"${value:.4f}"
+            else:
+                return f"${value:.2f}"
+        else:
+            return str(value)
+    except Exception as e:
+        logger.error(f"Error formatting number {value}: {str(e)}")
+        return str(value)
+
+def format_percentage(value):
+    """Format percentage values"""
+    try:
+        if pd.isna(value):
+            return "N/A"
+        if isinstance(value, str):
+            # Remove % if present and convert to float
+            value = float(value.strip('%').strip('+').strip('-'))
+        return f"{value:+.2f}%"
+    except Exception as e:
+        logger.error(f"Error formatting percentage {value}: {str(e)}")
+        return "N/A"
 
 def get_market_movers():
     """Get top gainers, losers, and most active stocks with SSL handling"""
@@ -21,146 +63,215 @@ def get_market_movers():
             response.raise_for_status()
             df = pd.read_html(response.text)[0]
             
-            # Select and rename required columns
-            df = df[['Symbol', 'Name', 'Price (Intraday)', 'Change %', 'Volume', 'Market Cap']]
-            df = df.rename(columns={
+            # Print column names for debugging
+            logger.info(f"Columns in dataframe: {df.columns.tolist()}")
+            
+            # Map old column names to new ones
+            column_map = {
+                'Symbol': 'Symbol',
+                'Name': 'Name',
+                'Price': 'Price',
+                'Price (Intraday)': 'Price',
+                'Change': 'Change',
                 'Change %': '% Change',
-                'Price (Intraday)': 'Price'
-            })
+                '% Change': '% Change',
+                'Volume': 'Volume',
+                'Avg Vol (3 month)': 'Volume',
+                'Market Cap': 'Market Cap'
+            }
+            
+            # Select required columns, handling different possible names
+            required_columns = []
+            for new_col, old_cols in {
+                'Symbol': ['Symbol'],
+                'Name': ['Name'],
+                'Price': ['Price', 'Price (Intraday)'],
+                '% Change': ['% Change', 'Change %'],
+                'Volume': ['Volume', 'Avg Vol (3 month)'],
+                'Market Cap': ['Market Cap']
+            }.items():
+                # Find first matching column
+                found = False
+                for old_col in old_cols:
+                    if old_col in df.columns:
+                        df[new_col] = df[old_col]
+                        found = True
+                        break
+                if not found:
+                    df[new_col] = 'N/A'
+                required_columns.append(new_col)
+            
+            df = df[required_columns]
+            
+            # Convert numeric columns
+            df['Price'] = pd.to_numeric(df['Price'].str.replace('$', '').str.replace(',', ''), errors='coerce')
+            df['% Change'] = pd.to_numeric(df['% Change'].str.replace('%', '').str.replace('+', '').str.replace(',', ''), errors='coerce')
+            df['Volume'] = pd.to_numeric(df['Volume'].str.replace(',', ''), errors='coerce')
+            df['Market Cap'] = pd.to_numeric(df['Market Cap'].str.replace('$', '').str.replace(',', '').str.replace('T', 'e12').str.replace('B', 'e9').str.replace('M', 'e6').str.replace('K', 'e3'), errors='coerce')
+            
             return df
             
-        # Helper functions to clean data
-        def clean_percentage(val):
-            if pd.isna(val):
-                return 0.0
-            if isinstance(val, (int, float)):
-                return float(val)
-            val = str(val).replace('%', '').replace('+', '').replace(',', '')
-            try:
-                return float(val)
-            except:
-                return 0.0
-                
-        def clean_price(val):
-            if pd.isna(val):
-                return 0.0
-            if isinstance(val, (int, float)):
-                return float(val)
-            val = str(val).replace('$', '').replace('+', '').replace(',', '')
-            try:
-                return float(val)
-            except:
-                return 0.0
-                
-        def clean_volume(val):
-            if pd.isna(val):
-                return 0.0
-            if isinstance(val, (int, float)):
-                return float(val)
-            val = str(val)
-            try:
-                val = val.replace(',', '')
-                if 'K' in val:
-                    return float(val.replace('K', '')) * 1000
-                elif 'M' in val:
-                    return float(val.replace('M', '')) * 1000000
-                elif 'B' in val:
-                    return float(val.replace('B', '')) * 1000000000
-                else:
-                    return float(val)
-            except:
-                return 0.0
-        
         # Get market data from Yahoo Finance with updated URLs
-        gainers = get_data('https://finance.yahoo.com/screener/predefined/day_gainers')
-        losers = get_data('https://finance.yahoo.com/screener/predefined/day_losers')
-        active = get_data('https://finance.yahoo.com/screener/predefined/most_actives')
+        gainers = get_data('https://finance.yahoo.com/gainers')
+        losers = get_data('https://finance.yahoo.com/losers')
+        active = get_data('https://finance.yahoo.com/most-active')
         
-        # Clean up data
-        for df in [gainers, losers, active]:
-            df['% Change'] = df['% Change'].apply(clean_percentage)
-            df['Price'] = df['Price'].apply(clean_price)
-            df['Volume'] = df['Volume'].apply(clean_volume)
-            
         return gainers.head(), losers.head(), active.head()
         
     except requests.exceptions.RequestException as e:
-        st.error(f"Network error fetching market data: {str(e)}")
+        logger.error(f"Network error fetching market data: {str(e)}")
         return None, None, None
     except ValueError as e:
-        st.error(f"Error processing market data: {str(e)}")
+        logger.error(f"Error processing market data: {str(e)}")
         return None, None, None
     except Exception as e:
-        st.error(f"Error fetching market data: {str(e)}")
+        logger.error(f"Error fetching market data: {str(e)}")
         return None, None, None
 
+def format_market_cap(value):
+    """Format market cap values"""
+    try:
+        if pd.isna(value):
+            return "N/A"
+        
+        value = float(value)
+        if value >= 1e12:
+            return f"${value/1e12:.2f}T"
+        elif value >= 1e9:
+            return f"${value/1e9:.2f}B"
+        elif value >= 1e6:
+            return f"${value/1e6:.2f}M"
+        else:
+            return f"${value/1e3:.2f}K"
+    except:
+        return "N/A"
 
 def display_movers_table(df, category):
     """Display market movers table with formatting"""
     try:
-        # Format the dataframe
-        df['Price'] = df['Price'].apply(lambda x: f"${x:.2f}")
-        df['% Change'] = df['% Change'].apply(lambda x: f"{x:+.2f}%")
-        df['Volume'] = df['Volume'].apply(lambda x: f"{x:,.0f}")
-        df['Market Cap'] = df['Market Cap'].apply(lambda x: f"${x:,.0f}")
+        if df is None or df.empty:
+            st.error(f"No data available for {category}")
+            return
+            
+        # Create a copy for display
+        display_df = df.copy()
         
-        # Display the table with custom formatting
+        # Format numeric columns
+        display_df['Price'] = display_df['Price'].apply(lambda x: f"${x:.2f}" if pd.notnull(x) else "N/A")
+        display_df['% Change'] = display_df['% Change'].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "N/A")
+        display_df['Volume'] = display_df['Volume'].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "N/A")
+        display_df['Market Cap'] = display_df['Market Cap'].apply(format_market_cap)
+        
+        # Display the table
         st.dataframe(
-            df.style.set_properties(**{
-                'background-color': '#f0f2f6',
-                'color': 'black',
-                'border-color': 'white'
-            })
+            display_df,
+            use_container_width=True,
+            column_config={
+                "Symbol": st.column_config.TextColumn("Symbol", width="small"),
+                "Name": st.column_config.TextColumn("Name", width="medium"),
+                "Price": st.column_config.TextColumn("Price", width="small"),
+                "% Change": st.column_config.TextColumn("% Change", width="small"),
+                "Volume": st.column_config.TextColumn("Volume", width="small"),
+                "Market Cap": st.column_config.TextColumn("Market Cap", width="small")
+            }
         )
     except Exception as e:
+        logger.error(f"Error displaying {category} table: {str(e)}")
         st.error(f"Error displaying {category} table: {str(e)}")
 
-
-def market_movers_tab():
-    """Market movers tab with enhanced UI and analysis"""
+def market_movers_tab(section=None):
+    """Market movers tab with sections"""
     try:
-        st.subheader("Market Movers")
+        # Get market movers data
+        gainers, losers, active = get_market_movers()
         
-        with st.spinner("Fetching market data..."):
-            # Get market movers data
-            gainers, losers, active = get_market_movers()
+        if section == "gainers":
+            display_movers_table(gainers, "gainers")
+            if gainers is not None:
+                st.metric("Average Gain", f"{gainers['% Change'].mean():+.2f}%")
+                
+        elif section == "losers":
+            display_movers_table(losers, "losers")
+            if losers is not None:
+                st.metric("Average Loss", f"{losers['% Change'].mean():+.2f}%")
+                
+        elif section == "active":
+            display_movers_table(active, "most active")
+            if active is not None:
+                st.metric("Total Volume", f"{active['Volume'].sum():,.0f}")
+                
+        else:
+            # Add stock input and analyze button
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col1:
+                ticker = st.text_input("Enter Stock Symbol:", key="market_movers_ticker").upper()
+            with col2:
+                analyze = st.button("Analyze")
+            with col3:
+                refresh = st.button("Refresh Data")
             
+            # Market Summary
             if gainers is not None and losers is not None and active is not None:
-                # Create three columns for different categories
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.write("### 📈 Top Gainers")
-                    display_movers_table(gainers, "gainers")
-                    
-                with col2:
-                    st.write("### 📉 Top Losers")
-                    display_movers_table(losers, "losers")
-                    
-                with col3:
-                    st.write("### 📊 Most Active")
-                    display_movers_table(active, "most active")
-                    
-                # Add market summary
-                st.write("### Market Summary")
-                avg_gain = gainers['% Change'].mean()
-                avg_loss = losers['% Change'].mean()
-                total_volume = active['Volume'].sum()
-                
+                st.markdown("---")
+                st.subheader("Market Summary")
                 summary_col1, summary_col2, summary_col3 = st.columns(3)
                 
                 with summary_col1:
-                    st.metric("Average Gain", f"{avg_gain:+.2f}%")
+                    st.metric("Average Gain", f"{gainers['% Change'].mean():+.2f}%")
                     
                 with summary_col2:
-                    st.metric("Average Loss", f"{avg_loss:+.2f}%")
+                    st.metric("Average Loss", f"{losers['% Change'].mean():+.2f}%")
                     
                 with summary_col3:
-                    st.metric("Total Volume", f"{total_volume:,.0f}")
+                    st.metric("Total Volume", f"{active['Volume'].sum():,.0f}")
+            
+            # Display individual stock analysis if requested
+            if ticker and analyze:
+                st.markdown("---")
+                st.subheader(f"Analysis for {ticker}")
+                
+                try:
+                    # Check if stock is in any of our lists
+                    in_gainers = ticker in gainers['Symbol'].values if gainers is not None else False
+                    in_losers = ticker in losers['Symbol'].values if losers is not None else False
+                    in_active = ticker in active['Symbol'].values if active is not None else False
                     
-                # Add refresh button
-                if st.button("🔄 Refresh Data"):
-                    st.experimental_rerun()
+                    if in_gainers:
+                        stock_data = gainers[gainers['Symbol'] == ticker].iloc[0]
+                        category = "Top Gainers"
+                    elif in_losers:
+                        stock_data = losers[losers['Symbol'] == ticker].iloc[0]
+                        category = "Top Losers"
+                    elif in_active:
+                        stock_data = active[active['Symbol'] == ticker].iloc[0]
+                        category = "Most Active"
+                    else:
+                        st.warning(f"{ticker} is not in today's market movers list")
+                        return
+                        
+                    # Display stock details
+                    detail_col1, detail_col2 = st.columns(2)
+                    
+                    with detail_col1:
+                        st.markdown(f"""
+                        **Category:** {category}
+                        **Company:** {stock_data['Name']}
+                        **Current Price:** ${stock_data['Price']:.2f}
+                        """)
+                        
+                    with detail_col2:
+                        st.markdown(f"""
+                        **% Change:** {stock_data['% Change']:+.2f}%
+                        **Volume:** {stock_data['Volume']:,.0f}
+                        **Market Cap:** {format_market_cap(stock_data['Market Cap'])}
+                        """)
+                        
+                except Exception as e:
+                    logger.error(f"Error analyzing stock {ticker}: {str(e)}")
+                    st.error(f"Error analyzing {ticker}. Please try again.")
                     
     except Exception as e:
-        st.error(f"Error in market movers tab: {str(e)}")
+        logger.error(f"Error in market movers tab: {str(e)}")
+        st.error("Error loading market movers. Please try refreshing the page.")
+
+market_movers_tab()

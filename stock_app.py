@@ -22,13 +22,15 @@ from utils import (
     calculate_macd, calculate_bollinger_bands, safe_divide,
     calculate_growth_rate, calculate_intrinsic_value
 )
-from technical_analysis import technical_analysis_tab, plot_daily_candlestick, plot_stock_history
-from buffett_analysis import buffett_analysis_tab
 from company_profile import company_profile_tab
-from market_movers import market_movers_tab
-from prediction import prediction_tab, predict_stock_price
-from stock_recommendations import stock_recommendations_tab
+from technical_analysis import technical_analysis_tab
+from prediction import prediction_tab
+from buffett_analysis import buffett_analysis_tab
 from options_analysis import options_analysis_tab
+from market_movers import market_movers_tab
+from fundamental_analysis import fundamental_analysis_tab
+from portfolio_analysis import portfolio_analysis_tab
+from stock_recommendations import stock_recommendations_tab
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -637,7 +639,6 @@ def prediction_tab():
 
 def main():
     """Main function to run the stock analysis app"""
-    st.set_page_config(page_title="StockPro", layout="wide")
     
     st.title("StockPro - Advanced Stock Analysis")
     
@@ -654,20 +655,21 @@ def main():
             value=st.session_state['ticker'],
             placeholder="e.g., AAPL",
             help="Enter a valid stock symbol to analyze"
-        )
+        ).upper()
     
     # Update session state if ticker changes
     if ticker != st.session_state['ticker']:
-        st.session_state['ticker'] = ticker.upper()
-        st.session_state['current_ticker'] = ticker.upper()  # For backwards compatibility
-        st.rerun()
+        st.session_state['ticker'] = ticker
+        st.session_state['current_ticker'] = ticker  # For backwards compatibility
+        if ticker:  # Only rerun if ticker is not empty
+            st.rerun()
     
     # Show current stock info if available
-    if st.session_state['ticker']:
+    if ticker:
         try:
-            stock = yf.Ticker(st.session_state['ticker'])
+            stock = yf.Ticker(ticker)
             info = stock.info
-            company_name = info.get('longName', st.session_state['ticker'])
+            company_name = info.get('longName', ticker)
             current_price = info.get('regularMarketPrice', 0)
             previous_close = info.get('previousClose', 0)
             price_change = ((current_price - previous_close) / previous_close) * 100 if previous_close else 0
@@ -679,46 +681,55 @@ def main():
                     f"{price_change:+.2f}%",
                     delta_color="normal"
                 )
+                
             with col3:
                 market_cap = info.get('marketCap', 0)
                 st.metric("Market Cap", format_large_number(market_cap))
             
             st.markdown(f"### {company_name}")
         except Exception as e:
-            if st.session_state['ticker']:
+            if ticker:
                 st.error(f"Error loading stock data: {str(e)}")
     
-    # Create tabs with original structure
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📊 Overview",
-        "📈 Technical Analysis",
-        "💰 Options Analysis",
-        "🎯 Stock Recommendations",
-        "🎩 Buffett Analysis",
-        "📱 Company Profile",
-        "🔥 Market Movers"
+    # Create tabs
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "Company Profile",
+        "Technical Analysis",
+        "Stock Prediction",
+        "Buffett Analysis",
+        "Options Analysis",
+        "Market Movers",
+        "Fundamental Analysis",
+        "Portfolio Analysis",
+        "Stock Recommendations"
     ])
     
     with tab1:
-        overview_tab()
+        company_profile_tab()
     
     with tab2:
         technical_analysis_tab()
-        
+    
     with tab3:
-        options_analysis_tab()
-        
+        prediction_tab()
+    
     with tab4:
-        stock_recommendations_tab()
-        
-    with tab5:
         buffett_analysis_tab()
-        
+    
+    with tab5:
+        options_analysis_tab()
+    
     with tab6:
-        company_profile_tab()
-        
-    with tab7:
         market_movers_tab()
+    
+    with tab7:
+        fundamental_analysis_tab()
+        
+    with tab8:
+        portfolio_analysis_tab()
+        
+    with tab9:
+        stock_recommendations_tab()
 
 if __name__ == "__main__":
     main()

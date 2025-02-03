@@ -31,6 +31,7 @@ from market_movers import market_movers_tab
 from fundamental_analysis import fundamental_analysis_tab
 from portfolio_analysis import portfolio_analysis_tab
 from stock_recommendations import stock_recommendations_tab
+from stock_chat import stock_chat_tab
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -640,6 +641,27 @@ def prediction_tab():
 def main():
     """Main function to run the stock analysis app"""
     
+    # Set page config to make it wider
+    st.set_page_config(
+        page_title="StockPro - Advanced Stock Analysis",
+        layout="wide",
+        initial_sidebar_state="collapsed"
+    )
+    
+    # Hide sidebar
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"] {display: none;}
+    .stApp {max-width: 100%;}
+    .stTabs [data-baseweb="tab-list"] {gap: 2px;}
+    .stTabs [data-baseweb="tab"] {
+        padding-left: 4px;
+        padding-right: 4px;
+        white-space: pre;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
     st.title("StockPro - Advanced Stock Analysis")
     
     # Initialize session state
@@ -692,20 +714,33 @@ def main():
                 st.error(f"Error loading stock data: {str(e)}")
     
     # Create tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "Company Profile",
         "Technical Analysis",
         "Stock Prediction",
         "Buffett Analysis",
         "Options Analysis",
         "Market Movers",
-        "Fundamental Analysis",
-        "Portfolio Analysis",
-        "Stock Recommendations"
+        "Stock Recommendations",
+        "Stock Chat"
     ])
     
     with tab1:
-        company_profile_tab()
+        # Create sub-tabs for Company Profile
+        subtab1, subtab2, subtab3 = st.tabs([
+            "Company Info",
+            "Portfolio Analysis",
+            "Fundamental Analysis"
+        ])
+        
+        with subtab1:
+            company_profile_tab()
+        
+        with subtab2:
+            portfolio_analysis_tab()
+            
+        with subtab3:
+            fundamental_analysis_tab()
     
     with tab2:
         technical_analysis_tab()
@@ -723,13 +758,10 @@ def main():
         market_movers_tab()
     
     with tab7:
-        fundamental_analysis_tab()
+        stock_recommendations_tab()
         
     with tab8:
-        portfolio_analysis_tab()
-        
-    with tab9:
-        stock_recommendations_tab()
+        stock_chat_tab()
 
 if __name__ == "__main__":
     main()

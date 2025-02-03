@@ -1,12 +1,426 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import plotly.graph_objects as go
-from scipy.stats import percentileofscore
 from datetime import datetime, timedelta
-from utils import calculate_rsi, calculate_macd
+import plotly.graph_objects as go
+from typing import Dict, List, Tuple, Optional
 
+def get_options_data(ticker: str) -> Tuple[yf.Ticker, List[str]]:
+    """Get options data for a given ticker"""
+    try:
+        # Create new Ticker object
+        stock = yf.Ticker(ticker)
+        
+        # Get options expiration dates
+        try:
+            expiration_dates = stock.options
+            if not expiration_dates:
+                st.warning(f"No options data available for {ticker}")
+                return None, []
+            return stock, expiration_dates
+        except Exception as e:
+            st.warning(f"Error getting options data: {str(e)}")
+            return None, []
+            
+    except Exception as e:
+        st.error(f"Error creating Ticker object: {str(e)}")
+        return None, []
+
+def calculate_implied_volatility(row: pd.Series) -> float:
+    """Calculate implied volatility"""
+    try:
+        return row['impliedVolatility'] * 100
+    except:
+        return np.nan
+
+def get_cio_letter(stock: yf.Ticker, expiry_date: str, stock_price: float, 
+                   iv_percentile: float, earnings_date: Optional[datetime],
+                   options_chain: pd.DataFrame) -> str:
+    """Generate a CIO letter with options trade recommendations"""
+    
+    # Get stock info and current date
+    try:
+        info = stock.info
+        # Get the ticker symbol from the stock object's ticker attribute
+        ticker_symbol = getattr(stock, 'ticker', None)
+        if ticker_symbol is None:
+            # Try to get it from the info dictionary
+            ticker_symbol = info.get('symbol', 'Unknown')
+            
+        company_name = info.get('longName', ticker_symbol)
+        sector = info.get('sector', 'N/A')
+        industry = info.get('industry', 'N/A')
+    except:
+        ticker_symbol = getattr(stock, 'ticker', 'Unknown')
+        company_name = ticker_symbol
+        sector = 'N/A'
+        industry = 'N/A'
+    
+    current_date = datetime.now().strftime('%B %d, %Y')
+    expiry = datetime.strptime(expiry_date, '%Y-%m-%d').strftime('%B %d, %Y')
+    
+    # Format earnings date if available
+    earnings_str = ""
+    if earnings_date:
+        days_to_earnings = (earnings_date - datetime.now()).days
+        if days_to_earnings > 0:
+            earnings_str = f"\nEarnings are scheduled in {days_to_earnings} days on {earnings_date.strftime('%B %d, %Y')}."
+        elif days_to_earnings == 0:
+            earnings_str = "\nEarnings are scheduled for today."
+    
+    # Calculate days to expiration
+    days_to_expiry = (datetime.strptime(expiry_date, '%Y-%m-%d') - datetime.now()).days
+    
+    # Analyze options data
+    calls = options_chain[options_chain['contractType'] == 'call'] if 'contractType' in options_chain.columns else options_chain.head(len(options_chain)//2)
+    puts = options_chain[options_chain['contractType'] == 'put'] if 'contractType' in options_chain.columns else options_chain.tail(len(options_chain)//2)
+    
+    # Find ATM options
+    atm_strike = min(options_chain['strike'], key=lambda x: abs(x - stock_price))
+    atm_call = calls[calls['strike'] == atm_strike].iloc[0] if not calls[calls['strike'] == atm_strike].empty else None
+    atm_put = puts[puts['strike'] == atm_strike].iloc[0] if not puts[puts['strike'] == atm_strike].empty else None
+    
+    # Determine market sentiment
+    sentiment = ""
+    if iv_percentile > 75:
+        sentiment = "highly volatile"
+    elif iv_percentile > 50:
+        sentiment = "moderately volatile"
+    elif iv_percentile > 25:
+        sentiment = "relatively stable"
+    else:
+        sentiment = "very stable"
+    
+    # Generate strategy recommendations
+    strategies = []
+    
+    # High IV strategies
+    if iv_percentile > 60:
+        strategies.append({
+            'name': "Iron Condor",
+            'description': "Sell OTM call and put credit spreads to take advantage of high implied volatility",
+            'risk_level': "Medium"
+        })
+        strategies.append({
+            'name': "Credit Spread",
+            'description': f"Sell OTM {'put' if stock_price > atm_strike else 'call'} spread to benefit from IV crush",
+            'risk_level': "Medium"
+        })
+    
+    # Low IV strategies
+    else:
+        strategies.append({
+            'name': "Long Call/Put",
+            'description': f"Buy {'calls' if stock_price < atm_strike else 'puts'} to benefit from potential directional move",
+            'risk_level': "High"
+        })
+        strategies.append({
+            'name': "Calendar Spread",
+            'description': "Buy longer-term options and sell shorter-term options to benefit from time decay",
+            'risk_level': "Medium"
+        })
+    
+    # Generate the letter
+    letter = f"""
+    # Options Analysis for {company_name} ({ticker_symbol})
+    
+    **Date:** {current_date}
+    
+    Dear Valued Investor,
+    
+    I hope this letter finds you well. Today, I am writing to provide you with a comprehensive analysis of the options market for {company_name} ({sector} - {industry}).
+    
+    ## Current Market Context
+    - Stock Price: ${stock_price:.2f}
+    - Days to Expiration: {days_to_expiry}
+    - IV Percentile: {iv_percentile:.1f}%{earnings_str}
+    
+    The options market is currently indicating a {sentiment} environment for {company_name}. 
+    
+    ## Volatility Analysis
+    With an IV percentile of {iv_percentile:.1f}%, the market is pricing in {'significant' if iv_percentile > 50 else 'moderate'} movement in the stock. 
+    {'This elevated volatility presents opportunities for premium selling strategies.' if iv_percentile > 60 else 'The lower volatility environment may favor directional strategies.'}
+    
+    ## Recommended Options Strategies
+    
+    Based on the current market conditions, here are my recommended strategies:
+    """
+    
+    # Add strategy details
+    for i, strategy in enumerate(strategies, 1):
+        letter += f"""
+    {i}. **{strategy['name']}**
+       - {strategy['description']}
+       - Risk Level: {strategy['risk_level']}
+        """
+    
+    # Add risk management guidelines
+    letter += """
+    ## Risk Management Guidelines
+    1. Position Size: Limit each options position to 1-3% of your portfolio
+    2. Stop Loss: Set stop losses at 50% of maximum risk for defined-risk trades
+    3. Profit Targets: Take profits at 50-75% of maximum potential profit
+    4. Time Management: Close positions when 21 days or less to expiration
+    
+    Please note that these recommendations are based on current market conditions and should be adjusted as conditions change. Always conduct your own due diligence and consider your risk tolerance before entering any position.
+    
+    Best regards,
+    Your Options Strategy Team
+    """
+    
+    return letter
+
+def get_current_price(stock: yf.Ticker) -> float:
+    """Get current stock price using multiple fallback methods"""
+    try:
+        # Try getting from history first (most reliable)
+        try:
+            hist = stock.history(period='1d')
+            if not hist.empty:
+                return float(hist['Close'].iloc[-1])
+        except:
+            pass
+            
+        # Try getting from info
+        try:
+            info = stock.info
+            if 'regularMarketPrice' in info and info['regularMarketPrice']:
+                return float(info['regularMarketPrice'])
+            if 'currentPrice' in info and info['currentPrice']:
+                return float(info['currentPrice'])
+        except:
+            pass
+            
+        # Try fast info as last resort
+        try:
+            fast_info = stock.fast_info
+            if hasattr(fast_info, 'last_price') and fast_info.last_price:
+                return float(fast_info.last_price)
+        except:
+            pass
+            
+        raise ValueError("Could not get current price from any source")
+        
+    except Exception as e:
+        st.error(f"Error getting current price: {str(e)}")
+        return None
+
+def calculate_option_greeks(row: pd.Series, stock_price: float, risk_free_rate: float = 0.05) -> pd.Series:
+    """Calculate option Greeks if they're not provided"""
+    try:
+        # Convert time to expiry to years
+        days_to_expiry = (pd.to_datetime(row['expiration']) - pd.Timestamp.now()).days / 365.0
+        
+        # Use Black-Scholes formula to calculate Greeks
+        S = stock_price  # Current stock price
+        K = row['strike']  # Strike price
+        r = risk_free_rate  # Risk-free rate
+        sigma = row['impliedVolatility']  # Implied volatility
+        t = days_to_expiry  # Time to expiration in years
+        
+        # Calculate d1 and d2
+        d1 = (np.log(S/K) + (r + sigma**2/2)*t) / (sigma*np.sqrt(t))
+        d2 = d1 - sigma*np.sqrt(t)
+        
+        # Calculate Greeks
+        from scipy.stats import norm
+        N = norm.cdf
+        n = norm.pdf
+        
+        # Delta
+        if row['contractType'] == 'call':
+            delta = N(d1)
+        else:
+            delta = N(d1) - 1
+            
+        # Gamma (same for calls and puts)
+        gamma = n(d1)/(S*sigma*np.sqrt(t))
+        
+        # Theta
+        theta = (-S*sigma*n(d1))/(2*np.sqrt(t)) - r*K*np.exp(-r*t)*N(d2 if row['contractType'] == 'call' else -d2)
+        
+        # Vega (same for calls and puts)
+        vega = S*np.sqrt(t)*n(d1)
+        
+        return pd.Series({
+            'delta': delta,
+            'gamma': gamma,
+            'theta': theta/365,  # Convert to daily theta
+            'vega': vega/100  # Convert to 1% change in IV
+        })
+    except:
+        return pd.Series({
+            'delta': 0.0,
+            'gamma': 0.0,
+            'theta': 0.0,
+            'vega': 0.0
+        })
+
+def highlight_atm(x, stock_price):
+    """Highlight ATM and near-ATM options"""
+    if x.name == 'strike':
+        return ['background-color: #e6ffe6' if abs(stock_price - v) < 5 else '' for v in x]
+    return ['' for _ in x]
+
+def options_analysis_tab():
+    """Options analysis tab with CIO letter and options chain"""
+    try:
+        if 'ticker' not in st.session_state:
+            st.warning("Please enter a stock symbol in the main input field")
+            return
+            
+        # Get and validate ticker
+        ticker = st.session_state['ticker']
+        if not ticker:
+            st.warning("Please enter a valid stock symbol")
+            return
+        
+        # Get options data
+        stock, expiration_dates = get_options_data(ticker)
+        
+        if not stock or not expiration_dates:
+            st.error(f"No options data available for {ticker}")
+            return
+            
+        # Get current stock price
+        stock_price = get_current_price(stock)
+        if stock_price is None:
+            st.error(f"Could not get current price for {ticker}")
+            return
+            
+        # Get earnings date if available
+        try:
+            earnings_date = pd.to_datetime(stock.calendar.iloc[0,0])
+        except:
+            earnings_date = None
+        
+        # Expiry date selection
+        st.markdown("## 🔍 Options Chain")
+        expiry_date = st.selectbox(
+            "Select Expiration Date",
+            expiration_dates,
+            format_func=lambda x: datetime.strptime(x, '%Y-%m-%d').strftime('%B %d, %Y')
+        )
+        
+        # Get options chain
+        options = stock.option_chain(expiry_date)
+        
+        # Calculate IV percentile
+        try:
+            # Get historical volatility data
+            hist_vol = stock.history(period='1y')['Close'].pct_change().std() * np.sqrt(252) * 100
+            current_iv = options.calls['impliedVolatility'].mean() * 100
+            iv_percentile = np.percentile([hist_vol, current_iv], 75)
+        except:
+            iv_percentile = 50  # Default to neutral if calculation fails
+        
+        # Create combined options chain
+        calls = options.calls.copy()
+        puts = options.puts.copy()
+        
+        # Add contract type and expiration
+        calls['contractType'] = 'call'
+        puts['contractType'] = 'put'
+        calls['expiration'] = expiry_date
+        puts['expiration'] = expiry_date
+        
+        # Calculate Greeks if they're missing
+        required_columns = ['strike', 'lastPrice', 'bid', 'ask', 'impliedVolatility', 'volume', 'openInterest']
+        greek_columns = ['delta', 'gamma', 'theta', 'vega']
+        
+        # Ensure required columns exist
+        for col in required_columns:
+            if col not in calls.columns:
+                calls[col] = 0.0
+            if col not in puts.columns:
+                puts[col] = 0.0
+        
+        # Calculate Greeks if any are missing
+        if not all(col in calls.columns for col in greek_columns):
+            greek_data = calls.apply(lambda row: calculate_option_greeks(row, stock_price), axis=1)
+            for col in greek_columns:
+                calls[col] = greek_data[col]
+                
+        if not all(col in puts.columns for col in greek_columns):
+            greek_data = puts.apply(lambda row: calculate_option_greeks(row, stock_price), axis=1)
+            for col in greek_columns:
+                puts[col] = greek_data[col]
+        
+        # Combine chains
+        chain = pd.concat([calls, puts])
+        
+        # Format the options chains
+        format_dict = {
+            'lastPrice': '${:.2f}',
+            'strike': '${:.2f}',
+            'bid': '${:.2f}',
+            'ask': '${:.2f}',
+            'impliedVolatility': '{:.1%}',
+            'delta': '{:.3f}',
+            'gamma': '{:.3f}',
+            'theta': '{:.3f}',
+            'vega': '{:.3f}',
+            'volume': '{:,.0f}',
+            'openInterest': '{:,.0f}'
+        }
+        
+        # Select columns to display
+        display_columns = [
+            'strike', 'lastPrice', 'bid', 'ask', 
+            'impliedVolatility', 'volume', 'openInterest',
+            'delta', 'gamma', 'theta', 'vega'
+        ]
+        
+        # Display options chain
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 📞 Calls")
+            # Sort calls by strike price
+            calls_display = calls[display_columns].sort_values('strike')
+            # Format and display
+            st.dataframe(
+                calls_display.style
+                .format(format_dict)
+                .apply(lambda x: highlight_atm(x, stock_price)),
+                height=400
+            )
+        
+        with col2:
+            st.markdown("### 📞 Puts")
+            # Sort puts by strike price
+            puts_display = puts[display_columns].sort_values('strike')
+            # Format and display
+            st.dataframe(
+                puts_display.style
+                .format(format_dict)
+                .apply(lambda x: highlight_atm(x, stock_price)),
+                height=400
+            )
+        
+        # Add summary metrics
+        st.markdown("### 📊 Options Summary")
+        metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+        
+        with metrics_col1:
+            st.metric("Total Call Volume", f"{calls['volume'].sum():,.0f}")
+        with metrics_col2:
+            st.metric("Total Put Volume", f"{puts['volume'].sum():,.0f}")
+        with metrics_col3:
+            cp_ratio = calls['volume'].sum() / puts['volume'].sum() if puts['volume'].sum() > 0 else float('inf')
+            st.metric("Call/Put Ratio", f"{cp_ratio:.2f}")
+        with metrics_col4:
+            st.metric("Avg IV", f"{current_iv:.1f}%")
+            
+        # Generate and display CIO letter
+        st.markdown("## 📈 Options Analysis and Recommendations")
+        letter = get_cio_letter(stock, expiry_date, stock_price, iv_percentile, earnings_date, chain)
+        st.markdown(letter)
+                
+    except Exception as e:
+        st.error(f"Error in options analysis: {str(e)}")
+        return
 
 def get_options_chain(ticker):
     """Fetch options chain data for a given ticker"""
@@ -66,255 +480,112 @@ def get_options_chain(ticker):
         st.error(f"Error fetching options chain: {str(e)}")
         return None, None, None
 
-
-def get_options_strategy(ticker, price, rsi, volatility):
-    """Determine the best options strategy based on technical indicators"""
+def calculate_max_pain(calls, puts):
+    """Calculate the max pain point"""
     try:
-        # Convert rsi to float if it's a Series
-        if isinstance(rsi, pd.Series):
-            rsi = float(rsi.iloc[-1])
+        # Get unique strike prices
+        strikes = sorted(set(calls['strike'].unique()) | set(puts['strike'].unique()))
         
-        strategy = {
-            'name': None,
-            'description': None,
-            'risk_level': None
-        }
+        # Calculate total value of options at each strike
+        max_pain = 0
+        min_value = float('inf')
         
-        # Determine market conditions
-        if rsi > 70:  # Overbought
-            if volatility > 0.3:  # High volatility
-                strategy['name'] = "Put Credit Spread"
-                strategy['description'] = "Sell OTM put spread to benefit from high IV and potential mean reversion"
-                strategy['risk_level'] = "Medium"
-            else:  # Low volatility
-                strategy['name'] = "Covered Call"
-                strategy['description'] = "Write covered calls against long stock position"
-                strategy['risk_level'] = "Low"
-        elif rsi < 30:  # Oversold
-            if volatility > 0.3:  # High volatility
-                strategy['name'] = "Call Credit Spread"
-                strategy['description'] = "Sell OTM call spread to benefit from high IV and potential mean reversion"
-                strategy['risk_level'] = "Medium"
-            else:  # Low volatility
-                strategy['name'] = "Long Call"
-                strategy['description'] = "Buy calls to benefit from potential upside"
-                strategy['risk_level'] = "High"
-        else:  # Neutral
-            if volatility > 0.3:
-                strategy['name'] = "Iron Condor"
-                strategy['description'] = "Sell OTM call and put spreads to benefit from high IV"
-                strategy['risk_level'] = "Medium"
-            else:
-                strategy['name'] = "Calendar Spread"
-                strategy['description'] = "Sell front-month option and buy back-month option"
-                strategy['risk_level'] = "Medium"
+        for strike in strikes:
+            total_value = 0
+            
+            # Add call values
+            call_options = calls[calls['strike'] <= strike]
+            total_value += (strike - call_options['strike']) * call_options['volume'].fillna(0)
+            
+            # Add put values
+            put_options = puts[puts['strike'] >= strike]
+            total_value += (put_options['strike'] - strike) * put_options['volume'].fillna(0)
+            
+            # Update max pain if this strike has lower total value
+            if total_value.sum() < min_value:
+                min_value = total_value.sum()
+                max_pain = strike
                 
-        return strategy
+        return max_pain
         
     except Exception as e:
-        st.error(f"Error determining options strategy: {str(e)}")
+        st.error(f"Error calculating max pain: {str(e)}")
         return None
 
-
-def get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy, calls, puts, expiration):
-    """Generate analyst perspective for options strategy"""
+def analyze_options_sentiment(iv, cp_ratio, current_price, max_pain):
+    """Analyze overall options market sentiment"""
     try:
-        # Get nearest ATM options (handle empty DataFrames)
-        if calls.empty or puts.empty:
-            st.warning("No options data available for analysis")
-            return None
-            
-        # Find ATM options safely
-        try:
-            atm_call_idx = abs(calls['strike'] - current_price).idxmin()
-            atm_put_idx = abs(puts['strike'] - current_price).idxmin()
-            atm_call = calls.loc[atm_call_idx]
-            atm_put = puts.loc[atm_put_idx]
-        except Exception as e:
-            st.warning("Could not find ATM options")
-            return None
+        sentiment = ""
         
-        # Calculate key metrics safely
-        try:
-            days_to_exp = (pd.to_datetime(expiration) - pd.Timestamp.now()).days
-            if 'impliedVolatility' in calls.columns:
-                iv_rank = percentileofscore(calls['impliedVolatility'].dropna(), calls['impliedVolatility'].mean())
-            else:
-                iv_rank = 50  # Default to neutral if no IV data
-        except Exception as e:
-            st.warning("Error calculating options metrics")
-            return None
-        
-        # Determine market sentiment
-        if rsi > 70:
-            sentiment = "overbought"
-            bias = "bearish"
-        elif rsi < 30:
-            sentiment = "oversold"
-            bias = "bullish"
+        # Analyze IV
+        if iv > 0.4:
+            sentiment += "High implied volatility suggests market uncertainty. "
+        elif iv < 0.2:
+            sentiment += "Low implied volatility suggests market complacency. "
         else:
-            sentiment = "neutral"
-            bias = "neutral"
-            
-        # Generate strategy-specific recommendations
-        if strategy['name'] == "Put Credit Spread":
-            strikes = f"Sell {current_price * 0.95:.2f} Put, Buy {current_price * 0.90:.2f} Put"
-            explanation = f"""
-            Given the overbought conditions (RSI: {rsi:.1f}) and high volatility ({volatility:.1%}), 
-            we recommend a Put Credit Spread strategy. This involves:
-            
-            1. Selling a put option at the {current_price * 0.95:.2f} strike
-            2. Buying a put option at the {current_price * 0.90:.2f} strike
-            3. Both options expiring in {days_to_exp} days
-            
-            This strategy allows you to profit from:
-            - High implied volatility ({iv_rank:.0f}th percentile)
-            - Potential mean reversion in the stock price
-            - Time decay (theta)
-            
-            Maximum profit is the credit received, while maximum loss is limited to the difference between strikes.
-            """
-            
-        elif strategy['name'] == "Covered Call":
-            strikes = f"Sell {current_price * 1.05:.2f} Call"
-            explanation = f"""
-            With the stock showing overbought signals (RSI: {rsi:.1f}) but low volatility ({volatility:.1%}), 
-            a Covered Call strategy is optimal. This involves:
-            
-            1. Holding (or buying) 100 shares of {ticker}
-            2. Selling a call option at the {current_price * 1.05:.2f} strike
-            3. Expiring in {days_to_exp} days
-            
-            This strategy allows you to:
-            - Generate additional income from your stock position
-            - Provide some downside protection
-            - Benefit from time decay
-            
-            Your upside is capped at the strike price, but you keep the premium regardless.
-            """
-            
-        elif strategy['name'] == "Iron Condor":
-            strikes = f"Sell {current_price * 1.05:.2f}/{current_price * 1.10:.2f} Call Spread, {current_price * 0.95:.2f}/{current_price * 0.90:.2f} Put Spread"
-            explanation = f"""
-            With neutral market conditions (RSI: {rsi:.1f}) and high volatility ({volatility:.1%}), 
-            an Iron Condor strategy offers the best risk/reward. This involves:
-            
-            1. Selling a call spread:
-               - Sell {current_price * 1.05:.2f} call
-               - Buy {current_price * 1.10:.2f} call
-            2. Selling a put spread:
-               - Sell {current_price * 0.95:.2f} put
-               - Buy {current_price * 0.90:.2f} put
-            3. All options expiring in {days_to_exp} days
-            
-            This strategy profits from:
-            - High implied volatility ({iv_rank:.0f}th percentile)
-            - Time decay
-            - Stock trading sideways
-            
-            Maximum profit is the net credit received, with defined risk on both sides.
-            """
-            
+            sentiment += "Moderate implied volatility suggests balanced market expectations. "
+        
+        # Analyze call/put ratio
+        if cp_ratio > 1.5:
+            sentiment += "High call/put ratio indicates bullish sentiment. "
+        elif cp_ratio < 0.5:
+            sentiment += "Low call/put ratio indicates bearish sentiment. "
         else:
-            strikes = f"ATM Call: {atm_call['strike']:.2f}, ATM Put: {atm_put['strike']:.2f}"
-            explanation = f"""
-            Given the current market conditions:
-            - RSI: {rsi:.1f} ({sentiment})
-            - Volatility: {volatility:.1%}
-            - Days to expiration: {days_to_exp}
+            sentiment += "Balanced call/put ratio suggests neutral sentiment. "
+        
+        # Analyze max pain
+        if max_pain > current_price * 1.05:
+            sentiment += "Max pain above current price suggests potential upward pressure. "
+        elif max_pain < current_price * 0.95:
+            sentiment += "Max pain below current price suggests potential downward pressure. "
+        else:
+            sentiment += "Max pain near current price suggests price stability. "
             
-            We recommend a {strategy['name']} strategy. This approach is suitable because:
-            - Market bias is {bias}
-            - Implied volatility is in the {iv_rank:.0f}th percentile
-            - {strategy['description']}
-            
-            Consider options near the current price ({current_price:.2f}) for optimal risk/reward.
-            Risk level is {strategy['risk_level'].lower()}.
-            """
-            
-        letter = f"""
-        # Options Strategy Analysis for {ticker}
-        
-        Dear Valued Investor,
-        
-        I am writing to provide you with a detailed analysis of the current options market conditions for {ticker} and our recommended strategy based on the prevailing market environment.
-        
-        ## Market Analysis
-        
-        Current market conditions indicate:
-        - Stock Price: ${current_price:.2f}
-        - RSI: {rsi:.1f} ({sentiment})
-        - Volatility: {volatility:.1%}
-        - IV Rank: {iv_rank:.0f}th percentile
-        - Days to Expiration: {days_to_exp}
-        
-        ## Strategy Recommendation: {strategy['name']}
-        
-        Based on our quantitative and qualitative analysis, we recommend implementing a {strategy['name']} strategy with the following specifications:
-        
-        **{strikes}**
-        
-        {explanation}
-        
-        ## Risk Management Framework
-        
-        1. **Position Sizing:**
-           - Initial Position: 2-3% of portfolio value
-           - Maximum Position: 5% of portfolio value
-           - Scale-in Approach: Consider multiple entries
-        
-        2. **Risk Parameters:**
-           - Stop Loss: Exit at 50% of maximum loss
-           - Profit Target: Take profits at 50-75% of maximum gain
-           - Time Stop: Close or roll position at 21 DTE
-        
-        3. **Volatility Considerations:**
-           - Current IV Percentile: {iv_rank:.0f}%
-           - IV Outlook: {'Elevated - consider premium selling strategies' if iv_rank > 60 else 'Low - consider premium buying strategies' if iv_rank < 30 else 'Moderate - neutral strategies preferred'}
-           - Expected Move: ${current_price * volatility / np.sqrt(252):.2f} (1-day, 1 SD)
-        
-        ## Execution Guidelines
-        
-        1. Entry Timing:
-           - {'Wait for price consolidation' if volatility > 0.3 else 'Consider immediate entry' if rsi < 40 else 'Scale in gradually'}
-           - Monitor volume for confirmation
-           - Check bid-ask spreads for liquidity
-        
-        2. Position Management:
-           - Regular delta adjustments if needed
-           - Monitor gamma exposure near expiration
-           - Consider rolling at 21 DTE
-        
-        3. Hedging Considerations:
-           - {'Consider protective puts' if strategy['risk_level'] == 'High' else 'No additional hedging needed'}
-           - Maintain balanced portfolio exposure
-           - Monitor correlation with existing positions
-        
-        ## Additional Considerations
-        
-        - Market Environment: {'Volatile' if volatility > 0.3 else 'Stable'} with {'strong' if abs(rsi - 50) > 20 else 'moderate' if abs(rsi - 50) > 10 else 'neutral'} momentum
-        - Earnings Impact: Monitor upcoming announcements
-        - Sector Analysis: Consider correlation with sector movements
-        
-        This strategy aligns with our current market outlook and offers a {'conservative' if strategy['risk_level'] == 'Low' else 'balanced' if strategy['risk_level'] == 'Medium' else 'aggressive'} approach to options trading in the present environment.
-        
-        Best regards,
-        
-        Nour Learoubi
-        Chief Investment Officer
-        StockPro Analytics
-        
-        *Note: This analysis is valid as of {pd.Timestamp.now().strftime('%Y-%m-%d')} and should be reviewed regularly as market conditions change.*
-        """
-        
-        return letter
+        return sentiment
         
     except Exception as e:
-        st.error(f"Error generating options analyst letter: {str(e)}")
-        import traceback
-        st.error(traceback.format_exc())
+        st.error(f"Error analyzing options sentiment: {str(e)}")
         return None
 
+def get_implied_volatility(ticker):
+    """Calculate average implied volatility from options chain"""
+    try:
+        stock = yf.Ticker(ticker)
+        
+        # Get nearest expiration options
+        expiry = stock.options[0]
+        chain = stock.option_chain(expiry)
+        
+        # Calculate average IV
+        all_iv = pd.concat([
+            chain.calls['impliedVolatility'],
+            chain.puts['impliedVolatility']
+        ])
+        
+        return np.mean(all_iv) * 100
+        
+    except Exception as e:
+        st.error(f"Error calculating IV: {str(e)}")
+        return None
+
+def get_call_put_ratio(ticker):
+    """Calculate call/put ratio based on volume"""
+    try:
+        stock = yf.Ticker(ticker)
+        
+        # Get nearest expiration options
+        expiry = stock.options[0]
+        chain = stock.option_chain(expiry)
+        
+        # Calculate volume ratio
+        call_volume = chain.calls['volume'].sum()
+        put_volume = chain.puts['volume'].sum()
+        
+        return call_volume / put_volume if put_volume > 0 else 0
+        
+    except Exception as e:
+        st.error(f"Error calculating call/put ratio: {str(e)}")
+        return None
 
 def display_analysis(ticker):
     """Display options analysis"""
@@ -408,151 +679,80 @@ def display_analysis(ticker):
             st.metric("Max Pain", f"${max_pain:.2f}")
             
         # Display options sentiment
-        sentiment = analyze_options_sentiment(iv, cp_ratio, current_price, max_pain)
+        sentiment = analyze_options_sentiment(get_implied_volatility(ticker), get_call_put_ratio(ticker), current_price, max_pain)
         if sentiment:
             st.markdown(f"### Market Sentiment\n{sentiment}")
             
     except Exception as e:
         st.error(f"Error displaying options analysis: {str(e)}")
 
-
 def calculate_max_pain(calls, puts):
     """Calculate the max pain point"""
     try:
-        strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        # Get unique strike prices
+        strikes = sorted(set(calls['strike'].unique()) | set(puts['strike'].unique()))
         
-        # Calculate total value for each strike
-        pain = []
+        # Calculate total loss at each strike price
+        max_pain = 0
+        min_loss = float('inf')
+        
         for strike in strikes:
-            # Calculate call pain
-            call_pain = sum(
-                max(0, strike - k) * v 
-                for k, v in zip(calls['strike'], calls['openInterest'])
-                if k <= strike
+            # Calculate loss for calls
+            call_loss = sum(
+                max(0, strike - call_strike) * call_volume
+                for call_strike, call_volume in zip(calls['strike'], calls['volume'])
+                if call_strike <= strike
             )
             
-            # Calculate put pain
-            put_pain = sum(
-                max(0, k - strike) * v 
-                for k, v in zip(puts['strike'], puts['openInterest'])
-                if k >= strike
+            # Calculate loss for puts
+            put_loss = sum(
+                max(0, put_strike - strike) * put_volume
+                for put_strike, put_volume in zip(puts['strike'], puts['volume'])
+                if put_strike >= strike
             )
             
-            pain.append(call_pain + put_pain)
+            total_loss = call_loss + put_loss
             
-        # Return strike price with minimum pain
-        return strikes[pain.index(min(pain))]
-    except:
-        return 0
+            if total_loss < min_loss:
+                min_loss = total_loss
+                max_pain = strike
+                
+        return max_pain
+        
+    except Exception as e:
+        st.error(f"Error calculating max pain: {str(e)}")
+        return None
 
 def analyze_options_sentiment(iv, cp_ratio, current_price, max_pain):
     """Analyze overall options market sentiment"""
-    # Score different factors
-    scores = []
-    
-    # Implied volatility
-    if iv > 50:
-        scores.append("High implied volatility suggests significant uncertainty")
-    elif iv > 30:
-        scores.append("Moderate implied volatility indicates normal market conditions")
-    else:
-        scores.append("Low implied volatility suggests stable price expectations")
-    
-    # Call/put ratio
-    if cp_ratio > 1.5:
-        scores.append("Strong bullish sentiment from call/put ratio")
-    elif cp_ratio < 0.5:
-        scores.append("Strong bearish sentiment from call/put ratio")
-    else:
-        scores.append("Neutral sentiment from call/put ratio")
-    
-    # Max pain
-    pain_diff = ((current_price / max_pain - 1) * 100) if max_pain > 0 else 0
-    if abs(pain_diff) < 2:
-        scores.append("Price near max pain point suggests potential consolidation")
-    elif pain_diff > 0:
-        scores.append(f"Price {pain_diff:.1f}% above max pain may face resistance")
-    else:
-        scores.append(f"Price {-pain_diff:.1f}% below max pain may find support")
-    
-    return "\n".join(scores)
-
-def get_current_price(ticker):
-    """Get current stock price"""
     try:
-        stock = yf.Ticker(ticker)
-        # Try different price fields in order of preference
-        price = (
-            stock.info.get('currentPrice') or 
-            stock.info.get('regularMarketPrice') or
-            stock.info.get('previousClose') or
-            stock.history(period='1d')['Close'].iloc[-1]
-        )
-        return price
+        sentiment = ""
+        
+        # Analyze IV
+        if iv > 50:
+            sentiment += "High implied volatility suggests significant price movement is expected. "
+        else:
+            sentiment += "Low implied volatility suggests relatively stable price movement. "
+            
+        # Analyze call/put ratio
+        if cp_ratio > 1.5:
+            sentiment += "High call/put ratio indicates bullish sentiment. "
+        elif cp_ratio < 0.5:
+            sentiment += "Low call/put ratio indicates bearish sentiment. "
+        else:
+            sentiment += "Balanced call/put ratio suggests neutral sentiment. "
+            
+        # Analyze max pain
+        if max_pain:
+            diff = ((max_pain - current_price) / current_price) * 100
+            if abs(diff) > 5:
+                sentiment += f"Max pain point is significantly {'above' if diff > 0 else 'below'} current price, "
+                sentiment += "suggesting potential price movement towards ${:.2f}. ".format(max_pain)
+            else:
+                sentiment += "Current price is near the max pain point. "
+                
+        return sentiment
+        
     except Exception as e:
-        st.error(f"Error getting price: {str(e)}")
-        return None
-
-def get_implied_volatility(ticker):
-    """Calculate average implied volatility from options chain"""
-    try:
-        stock = yf.Ticker(ticker)
-        # Get options expiration dates
-        expirations = stock.options
-        
-        if not expirations:
-            return 0
-            
-        # Get nearest expiration date
-        nearest_exp = expirations[0]
-        
-        # Get options chain for nearest expiration
-        calls = stock.option_chain(nearest_exp).calls
-        puts = stock.option_chain(nearest_exp).puts
-        
-        # Calculate average implied volatility
-        call_iv = calls['impliedVolatility'].mean() * 100
-        put_iv = puts['impliedVolatility'].mean() * 100
-        
-        return (call_iv + put_iv) / 2
-    except:
-        return 0
-
-def get_call_put_ratio(ticker):
-    """Calculate call/put ratio based on volume"""
-    try:
-        stock = yf.Ticker(ticker)
-        expirations = stock.options
-        
-        if not expirations:
-            return 1.0
-            
-        # Get nearest expiration date
-        nearest_exp = expirations[0]
-        
-        # Get options chain
-        calls = stock.option_chain(nearest_exp).calls
-        puts = stock.option_chain(nearest_exp).puts
-        
-        # Calculate total volume
-        call_volume = calls['volume'].sum()
-        put_volume = puts['volume'].sum()
-        
-        if put_volume == 0:
-            return 1.0
-            
-        return call_volume / put_volume
-    except:
-        return 1.0
-
-def options_analysis_tab():
-    """Display options analysis and trading strategies"""
-    st.subheader("Options Analysis")
-    
-    # Get ticker from session state
-    ticker = st.session_state.ticker
-    
-    if ticker:
-        display_analysis(ticker)
-    else:
-        st.warning("Please enter a stock symbol to analyze options.")
+        st.error(f"Error analyzing options sentiment: {str(e)}")
+        return ""

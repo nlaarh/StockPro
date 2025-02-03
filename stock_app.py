@@ -1,60 +1,38 @@
 import streamlit as st
-
-# Set page config at the very top
-st.set_page_config(
-    page_title="StockPro",
-    page_icon="📈",
-    layout="wide"
-)
-
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
+import altair as alt
 import requests
 import json
 import logging
 import traceback
-from datetime import datetime, timedelta
 import time
 import re
-
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from prophet import Prophet
+import matplotlib.pyplot as plt
+from utils import (
+    calculate_rsi, format_large_number, format_percentage,
+    calculate_delta, calculate_gamma, calculate_theta, calculate_vega,
+    calculate_macd, calculate_bollinger_bands, safe_divide,
+    calculate_growth_rate, calculate_intrinsic_value
+)
 from technical_analysis import technical_analysis_tab, plot_daily_candlestick, plot_stock_history
 from buffett_analysis import buffett_analysis_tab
-from options_analysis import (
-    options_analysis_tab, get_options_chain, get_options_strategy, 
-    get_options_analyst_letter
-)
-from utils import calculate_rsi, calculate_macd
 from company_profile import company_profile_tab
 from market_movers import market_movers_tab
-import stock_recommendations
+from prediction import prediction_tab, predict_stock_price
+from stock_recommendations import stock_recommendations_tab
+from options_analysis import options_analysis_tab
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Add custom CSS
-st.markdown("""
-<style>
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 20px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #FFFFFF;
-        border-radius: 4px;
-        color: #000000;
-        padding: 10px 20px;
-        font-size: 16px;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #F0F2F6;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 def get_stock_data(ticker, period="1y"):
     """Get stock data with technical indicators"""
@@ -68,19 +46,22 @@ def get_stock_data(ticker, period="1y"):
             return None
             
         # Calculate technical indicators
-        data['SMA20'] = data['Close'].rolling(window=20).mean()
-        data['SMA50'] = data['Close'].rolling(window=50).mean()
-        data['SMA200'] = data['Close'].rolling(window=200).mean()
+        delta = data['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        data['RSI'] = 100 - (100 / (1 + rs))
         
-        # Calculate RSI
-        rsi_data = calculate_rsi(data['Close'])
-        data['RSI'] = rsi_data
+        # Calculate Moving Averages
+        data['MA20'] = data['Close'].rolling(window=20).mean()
+        data['MA50'] = data['Close'].rolling(window=50).mean()
+        data['MA200'] = data['Close'].rolling(window=200).mean()
         
         # Calculate MACD
-        macd_data = calculate_macd(data['Close'])
-        data['MACD'] = macd_data['MACD']
-        data['Signal'] = macd_data['Signal']
-        data['MACD_Hist'] = macd_data['Histogram']
+        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = exp1 - exp2
+        data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
         
         return data
         
@@ -89,374 +70,651 @@ def get_stock_data(ticker, period="1y"):
         logger.error(f"Error fetching stock data: {str(e)}")
         return None
 
-def predict_stock_price(data, prediction_days=7, model_type="Random Forest"):
+def predict_stock_price(data, prediction_days=7, model_type="Ollama 3.2"):
     """Predict stock prices using various models"""
     try:
-        # Prepare features
-        data = data.copy()
-        data['MA5'] = data['Close'].rolling(window=5).mean()
-        data['MA20'] = data['Close'].rolling(window=20).mean()
-        data['RSI'] = calculate_rsi(data)
-        macd_data = calculate_macd(data)
-        data['MACD'] = macd_data['MACD']
-        data['Signal'] = macd_data['Signal']
+        # Prepare data
+        df = data.copy()
+        df['Target'] = df['Close'].shift(-prediction_days)
         
-        # Drop any NaN values
-        data = data.dropna()
+        # Calculate RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).fillna(0)
+        loss = (-delta.where(delta < 0, 0)).fillna(0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
         
-        if len(data) < 60:  # Need enough historical data
-            return None, None, None
+        # Calculate Moving Averages
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA50'] = df['Close'].rolling(window=50).mean()
+        
+        # Calculate MACD
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp1 - exp2
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Calculate Volume MA
+        df['Volume_MA20'] = df['Volume'].rolling(window=20).mean()
+        
+        # Drop NaN values
+        df = df.dropna()
+        
+        if len(df) < prediction_days:
+            st.error("Not enough data for prediction")
+            return None
             
-        # Prepare features and target
-        features = ['Open', 'High', 'Low', 'Close', 'Volume', 'MA5', 'MA20', 'RSI', 'MACD']
-        X = data[features].values
-        y = data['Close'].values
+        # Create features
+        features = [
+            'Open', 'High', 'Low', 'Close', 'Volume',
+            'MA20', 'MA50', 'RSI', 'MACD', 'Signal', 'Volume_MA20'
+        ]
         
-        # Scale the data
-        scaler = MinMaxScaler()
-        X_scaled = scaler.fit_transform(X)
+        X = df[features].values
+        y = df['Target'].values
         
-        # Create sequences
-        sequence_length = 60  # Use last 60 days to predict next day
-        X_sequences = []
-        y_sequences = []
+        # Split data
+        split = int(len(X) * 0.8)
+        X_train, X_test = X[:split], X[split:-prediction_days]
+        y_train, y_test = y[:split], y[split:-prediction_days]
         
-        for i in range(len(X_scaled) - sequence_length):
-            X_sequences.append(X_scaled[i:(i + sequence_length)])
-            y_sequences.append(y[i + sequence_length])
-            
-        X_sequences = np.array(X_sequences)
-        y_sequences = np.array(y_sequences)
+        # Scale data
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        X_pred = scaler.transform(X[-prediction_days:])
         
-        # Train the selected model
+        # Select and train model
         if model_type == "Random Forest":
             model = RandomForestRegressor(n_estimators=100, random_state=42)
-            model.fit(X_sequences.reshape(X_sequences.shape[0], -1), y_sequences)
+            model.fit(X_train_scaled, y_train)
+            predictions = model.predict(X_pred)
+            
         elif model_type == "XGBoost":
-            model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
-            model.fit(X_sequences.reshape(X_sequences.shape[0], -1), y_sequences)
+            model = XGBRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42
+            )
+            model.fit(X_train_scaled, y_train)
+            predictions = model.predict(X_pred)
+            
         elif model_type == "LightGBM":
-            model = lgb.LGBMRegressor(random_state=42)
-            model.fit(X_sequences.reshape(X_sequences.shape[0], -1), y_sequences)
-        else:
-            return None, None, None
+            model = LGBMRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42
+            )
+            model.fit(X_train_scaled, y_train)
+            predictions = model.predict(X_pred)
             
-        # Generate predictions
-        predictions = []
-        confidence_lower = []
-        confidence_upper = []
-        last_sequence = X_scaled[-sequence_length:]
-        
-        for _ in range(prediction_days):
-            # Predict next day
-            next_pred = model.predict(last_sequence.reshape(1, -1))
-            predictions.append(next_pred[0])
+        elif model_type == "Prophet":
+            # Prepare data for Prophet
+            prophet_df = pd.DataFrame({
+                'ds': df.index,
+                'y': df['Close']
+            })
             
-            # Calculate confidence bands (using model's feature importances)
-            std = np.std(y_sequences) * (1 - model.score(X_sequences.reshape(X_sequences.shape[0], -1), y_sequences))
-            confidence_lower.append(next_pred[0] - 2 * std)
-            confidence_upper.append(next_pred[0] + 2 * std)
+            # Create and fit Prophet model
+            model = Prophet(
+                daily_seasonality=True,
+                yearly_seasonality=True,
+                weekly_seasonality=True
+            )
+            model.fit(prophet_df)
             
-            # Update sequence for next prediction
-            new_row = np.zeros_like(X_scaled[0])
-            new_row[3] = next_pred[0]  # Set Close price
-            last_sequence = np.vstack((last_sequence[1:], new_row))
+            # Make future dataframe
+            future = model.make_future_dataframe(periods=prediction_days)
+            forecast = model.predict(future)
             
-        return predictions, (confidence_lower, confidence_upper), features
-        
-    except Exception as e:
-        logger.error(f"Error in predict_stock_price: {str(e)}")
-        return None, None, None
-
-def prediction_tab():
-    """Stock Prediction tab"""
-    try:
-        st.header("Stock Price Prediction")
-        
-        # Stock input
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            ticker = st.text_input("Enter Stock Symbol:", "AAPL", key="prediction_ticker").upper()
+            # Return only the predictions
+            predictions = forecast['yhat'].tail(prediction_days).values
             
-        if ticker:
-            # Import prediction module only when needed
-            from prediction import display_prediction
-            display_prediction(ticker)
+        elif model_type in ["Ollama 3.2", "DeepSeek-R1"]:
+            # Use LLM for prediction
+            current_price = df['Close'].iloc[-1]
+            hist_prices = df['Close'].tail(30).tolist()
+            price_changes = df['Close'].pct_change().tail(30).tolist()
+            avg_volume = df['Volume'].tail(30).mean()
+            rsi = df['RSI'].iloc[-1]
+            macd = df['MACD'].iloc[-1]
+            signal = df['Signal'].iloc[-1]
+            ma20 = df['MA20'].iloc[-1]
+            ma50 = df['MA50'].iloc[-1]
             
-    except ImportError as e:
-        st.error("Failed to load prediction module. Please check that prediction.py exists in the same directory.")
-    except Exception as e:
-        st.error(f"Error in Prediction tab: {str(e)}")
-
-def main():
-    """Main function to run the Streamlit app"""
-    try:
-        # Initialize session state
-        if 'active_tab' not in st.session_state:
-            st.session_state.active_tab = 'company'
-        
-        if 'stock_symbol' not in st.session_state:
-            st.session_state.stock_symbol = 'AAPL'
-        
-        # Header section with clean layout
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.title("📈 StockPro")
-            st.markdown("Advanced Stock Analysis and Prediction Platform")
-        
-        # Single stock input field
-        st.session_state.stock_symbol = st.text_input(
-            "Enter Stock Symbol:",
-            value=st.session_state.stock_symbol,
-            key="global_stock_symbol"
-        ).upper()
-        
-        # Create tabs
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-            "Company Profile",
-            "Technical Analysis",
-            "Stock Prediction",
-            "Buffett Analysis",
-            "Options Analysis",
-            "Stock Recommendations",
-            "Market Movers"
-        ])
-        
-        # Company Profile Tab
-        with tab1:
-            company_profile_tab(st.session_state.stock_symbol)
-        
-        # Technical Analysis Tab
-        with tab2:
-            technical_analysis_tab()
-        
-        # Stock Prediction Tab
-        with tab3:
-            prediction_tab()
-        
-        # Buffett Analysis Tab
-        with tab4:
-            buffett_analysis_tab()
-        
-        # Options Analysis Tab
-        with tab5:
-            options_analysis_tab(st.session_state.stock_symbol)
-        
-        # Stock Recommendations Tab
-        with tab6:
-            stock_recommendations.recommendations_tab()
-        
-        # Market Movers Tab
-        with tab7:
-            market_movers_tab()
+            prompt = f"""You are a stock market expert. Analyze this data and predict the stock price movement:
+            Current Price: ${current_price:.2f}
+            Technical Indicators:
+            - RSI ({rsi:.2f}): {'Overbought' if rsi > 70 else 'Oversold' if rsi < 30 else 'Neutral'}
+            - MACD: {macd:.2f} (Signal: {signal:.2f})
+            - 20-day MA: ${ma20:.2f} ({'Above' if current_price > ma20 else 'Below'} price)
+            - 50-day MA: ${ma50:.2f} ({'Above' if current_price > ma50 else 'Below'} price)
+            - Average Volume: {avg_volume:,.0f}
             
-    except Exception as e:
-        st.error(f"Application error: {str(e)}")
-
-def market_movers_tab():
-    """Market Movers tab with subtabs"""
-    try:
-        st.header("Market Movers")
-        
-        # Create subtabs
-        subtab1, subtab2, subtab3 = st.tabs(["Top Gainers", "Top Losers", "Most Active"])
-        
-        with subtab1:
-            st.subheader("Top Gainers")
-            gainers = get_market_movers('gainers')
-            if gainers is not None:
-                display_movers_table(gainers, 'gainers')
-            else:
-                st.error("Unable to fetch top gainers data")
+            Recent Performance:
+            - Last 30 days price changes: {[f'{x*100:.1f}%' for x in price_changes if not pd.isna(x)]}
             
-        with subtab2:
-            st.subheader("Top Losers")
-            losers = get_market_movers('losers')
-            if losers is not None:
-                display_movers_table(losers, 'losers')
-            else:
-                st.error("Unable to fetch top losers data")
+            Based on this technical analysis, predict:
+            1. Price movement direction (UP/DOWN)
+            2. Percentage change (-10% to +10%)
+            3. Confidence level (0-100%)
             
-        with subtab3:
-            st.subheader("Most Active")
-            active = get_market_movers('active')
-            if active is not None:
-                display_movers_table(active, 'active')
-            else:
-                st.error("Unable to fetch most active stocks data")
+            Format your response EXACTLY as JSON:
+            {{
+                "direction": "UP or DOWN",
+                "percentage": float,
+                "confidence": int
+            }}
             
-    except Exception as e:
-        st.error(f"Error in Market Movers tab: {str(e)}")
-
-def get_market_movers(category):
-    """Get market movers data using yfinance"""
-    try:
-        # Define tickers for each category
-        tickers = {
-            'gainers': ['^GSPC', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'JPM', 'V'],
-            'losers': ['^DJI', 'WMT', 'JNJ', 'PG', 'XOM', 'BAC', 'HD', 'CVX', 'PFE', 'KO'],
-            'active': ['^IXIC', 'AMD', 'INTC', 'MU', 'CSCO', 'QCOM', 'PYPL', 'NFLX', 'DIS', 'ADBE']
-        }
-        
-        # Get data for selected category
-        selected_tickers = tickers.get(category, tickers['active'])
-        data = []
-        
-        for ticker in selected_tickers:
+            ONLY return the JSON object, nothing else.
+            """
+            
             try:
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                hist = stock.history(period='1d')
+                response = requests.post(
+                    'http://localhost:11434/api/generate',
+                    json={
+                        "model": "llama2" if model_type == "Ollama 3.2" else "deepseek-coder",
+                        "prompt": prompt,
+                        "stream": False
+                    },
+                    timeout=30
+                )
                 
-                if not hist.empty:
-                    current_price = hist['Close'].iloc[-1]
-                    prev_price = hist['Open'].iloc[0]
-                    price_change = current_price - prev_price
-                    pct_change = (price_change / prev_price) * 100
+                if response.status_code == 200:
+                    result = json.loads(response.json()['response'])
+                    pct_change = float(result['percentage'])
                     
-                    data.append({
-                        'symbol': ticker,
-                        'name': info.get('longName', ticker),
-                        'price': current_price,
-                        'change': price_change,
-                        '% change': pct_change,
-                        'volume': hist['Volume'].iloc[-1],
-                        'market_cap': info.get('marketCap', 0)
-                    })
+                    # Clamp the percentage change to [-10, 10]
+                    pct_change = max(min(pct_change, 10), -10)
+                    
+                    # Generate predictions
+                    predictions = []
+                    for day in range(prediction_days):
+                        if day == 0:
+                            pred = current_price * (1 + pct_change/100)
+                        else:
+                            # Decay the effect for future days
+                            decay = (prediction_days - day) / prediction_days
+                            daily_change = (pct_change/100) * decay
+                            pred = predictions[-1] * (1 + daily_change)
+                        predictions.append(pred)
+                    
+                    predictions = np.array(predictions)
+                    
+                    # Show the LLM's analysis
+                    st.info(f"""
+                    **{model_type} Analysis**
+                    - Direction: {result['direction']}
+                    - Predicted Change: {pct_change:.1f}%
+                    - Confidence: {result['confidence']}%
+                    """)
+                    
+                else:
+                    st.warning(f"Error connecting to {model_type} service. Falling back to Random Forest model.")
+                    model = RandomForestRegressor(n_estimators=100, random_state=42)
+                    model.fit(X_train_scaled, y_train)
+                    predictions = model.predict(X_pred)
+                    
             except Exception as e:
-                logger.error(f"Error fetching data for {ticker}: {str(e)}")
-                continue
+                st.warning(f"Error in {model_type} prediction: {str(e)}. Falling back to Random Forest model.")
+                model = RandomForestRegressor(n_estimators=100, random_state=42)
+                model.fit(X_train_scaled, y_train)
+                predictions = model.predict(X_pred)
         
-        # Convert to DataFrame
-        df = pd.DataFrame(data)
-        
-        # Sort based on category
-        if category == 'gainers':
-            df = df.sort_values('% change', ascending=False)
-        elif category == 'losers':
-            df = df.sort_values('% change', ascending=True)
-        else:  # active
-            df = df.sort_values('volume', ascending=False)
-        
-        return df.head(5)  # Return top 5
-        
-    except Exception as e:
-        logger.error(f"Error getting market movers data: {str(e)}")
-        return None
-
-def display_movers_table(df, category):
-    """Display market movers table"""
-    try:
-        if df is None or df.empty:
-            st.error(f"No data available for {category}")
-            return
-            
-        # Format numeric columns
-        df = df.copy()
-        df['price'] = df['price'].apply(lambda x: f"${x:,.2f}")
-        df['change'] = df['change'].apply(lambda x: f"${x:,.2f}")
-        df['% change'] = df['% change'].apply(lambda x: f"{x:,.2f}%")
-        df['volume'] = df['volume'].apply(lambda x: f"{x:,.0f}")
-        df['market_cap'] = df['market_cap'].apply(lambda x: f"${x:,.0f}" if x > 0 else "N/A")
-        
-        # Rename columns for display
-        df.columns = ['Symbol', 'Company', 'Price', 'Change', '% Change', 'Volume', 'Market Cap']
-        
-        # Display table
-        st.dataframe(
-            df,
-            column_config={
-                "Symbol": st.column_config.TextColumn(
-                    "Symbol",
-                    help="Stock symbol",
-                    width="small",
-                ),
-                "Company": st.column_config.TextColumn(
-                    "Company",
-                    help="Company name",
-                    width="medium",
-                ),
-                "Price": st.column_config.TextColumn(
-                    "Price",
-                    help="Current stock price",
-                    width="small",
-                ),
-                "Change": st.column_config.TextColumn(
-                    "Change",
-                    help="Price change",
-                    width="small",
-                ),
-                "% Change": st.column_config.TextColumn(
-                    "% Change",
-                    help="Percentage change",
-                    width="small",
-                ),
-                "Volume": st.column_config.TextColumn(
-                    "Volume",
-                    help="Trading volume",
-                    width="medium",
-                ),
-                "Market Cap": st.column_config.TextColumn(
-                    "Market Cap",
-                    help="Market capitalization",
-                    width="medium",
-                ),
-            },
-            hide_index=True,
-            use_container_width=True
+        # Create prediction series with future dates
+        prediction_series = pd.Series(
+            predictions,
+            index=pd.date_range(
+                start=df.index[-1] + pd.Timedelta(days=1),
+                periods=prediction_days,
+                freq='B'
+            )
         )
         
+        return prediction_series
+        
     except Exception as e:
-        logger.error(f"Error displaying market movers table: {str(e)}")
-        st.error("Error displaying data table")
+        st.error(f"Error in prediction: {str(e)}")
+        return None
 
-def technical_analysis_tab():
-    """Technical Analysis tab"""
+def prediction_tab():
+    """Stock price prediction tab"""
     try:
-        # Get user input
-        ticker = st.sidebar.text_input("Enter Stock Symbol (e.g., AAPL)", "AAPL").upper()
+        st.header("🔮 Stock Price Prediction")
         
-        if ticker:
-            # Get stock data
-            data = get_stock_data(ticker)
+        # Get ticker from session state
+        ticker = st.session_state.get('current_ticker', '')
+        if not ticker:
+            st.warning("Please enter a stock ticker above.")
+            return
             
-            if data is not None:
-                # Call technical analysis function
-                from technical_analysis import technical_analysis_tab as show_technical_analysis
-                show_technical_analysis(ticker, data)
-            else:
-                st.error(f"Could not fetch data for {ticker}")
-    except Exception as e:
-        st.error(f"Error in technical analysis tab: {str(e)}")
-        logger.error(f"Error in technical analysis tab: {str(e)}\n{traceback.format_exc()}")
+        # User inputs
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col2:
+            prediction_days = st.number_input(
+                "Prediction Days:",
+                min_value=1,
+                max_value=30,
+                value=7,
+                key="pred_days"
+            )
+        
+        with col3:
+            model_type = st.selectbox(
+                "Select Model:",
+                [
+                    "Ollama 3.2",
+                    "DeepSeek-R1",
+                    "Random Forest",
+                    "XGBoost",
+                    "LightGBM",
+                    "Prophet"
+                ],
+                index=0,
+                key="pred_model"
+            )
+            
+        # Model explanation
+        with st.expander("ℹ️ Model Information"):
+            if model_type == "Random Forest":
+                st.markdown("""
+                    **Random Forest Model**
+                    - Ensemble learning method for prediction
+                    - Combines multiple decision trees
+                    - Good at handling non-linear relationships
+                    - Less prone to overfitting
+                """)
+            elif model_type == "Ollama 3.2":
+                st.markdown("""
+                    **Ollama 3.2 LLM**
+                    - Large Language Model for market analysis
+                    - Considers technical and fundamental factors
+                    - Provides detailed price movement rationale
+                    - Includes confidence bands for predictions
+                """)
+            elif model_type == "DeepSeek-R1":
+                st.markdown("""
+                    **DeepSeek-R1 Model**
+                    - Advanced language model for financial analysis
+                    - Specialized in market pattern recognition
+                    - Considers global market conditions
+                    - Provides comprehensive market analysis
+                """)
+            elif model_type == "XGBoost":
+                st.markdown("""
+                    **XGBoost Model**
+                    - Gradient boosting algorithm
+                    - Excellent performance on structured data
+                    - Handles missing values well
+                    - Regularization to prevent overfitting
+                """)
+            elif model_type == "LightGBM":
+                st.markdown("""
+                    **LightGBM Model**
+                    - Light Gradient Boosting Machine
+                    - Fast training speed
+                    - High efficiency with large datasets
+                    - Good handling of categorical features
+                """)
+            elif model_type == "Prophet":
+                st.markdown("""
+                    **Facebook Prophet**
+                    - Specialized in time series forecasting
+                    - Handles seasonality and holidays
+                    - Robust to missing data and outliers
+                    - Good for daily and weekly patterns
+                """)
+        
+        if st.button("Generate Prediction", key="generate_prediction"):
+            with st.spinner("Fetching data and generating prediction..."):
+                try:
+                    # Get stock data
+                    stock = yf.Ticker(ticker)
+                    data = stock.history(period="1y")
+                    
+                    if data.empty:
+                        st.error(f"Could not fetch data for {ticker}")
+                        return
+                    
+                    # Generate prediction
+                    if model_type in ["Ollama 3.2", "DeepSeek-R1"]:
+                        # Check if LLM is available
+                        try:
+                            response = requests.get('http://localhost:11434/api/tags')
+                            if response.status_code != 200:
+                                st.warning("LLM server not available. Falling back to Random Forest model.")
+                                prediction = predict_stock_price(data, prediction_days, "Random Forest")
+                            else:
+                                prediction = predict_stock_price(data, prediction_days, model_type)
+                        except:
+                            st.warning("LLM server not available. Falling back to Random Forest model.")
+                            prediction = predict_stock_price(data, prediction_days, "Random Forest")
+                    else:
+                        prediction = predict_stock_price(data, prediction_days, model_type)
+                    
+                    if prediction is not None:
+                        # Display current stock info
+                        current_price = data['Close'].iloc[-1]
+                        prev_close = data['Close'].iloc[-2]
+                        price_change = ((current_price - prev_close) / prev_close) * 100
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric(
+                                "Current Price",
+                                f"${current_price:.2f}",
+                                f"{price_change:+.2f}%"
+                            )
+                        
+                        with col2:
+                            st.metric(
+                                "52-Week High",
+                                f"${data['High'].max():.2f}"
+                            )
+                        
+                        with col3:
+                            st.metric(
+                                "52-Week Low",
+                                f"${data['Low'].min():.2f}"
+                            )
+                        
+                        # Plot predictions using Altair
+                        # Prepare data for plotting
+                        hist_df = pd.DataFrame({
+                            'Date': data.index,
+                            'Price': data['Close'].values,
+                            'Type': 'Historical'
+                        })
+                        
+                        pred_df = pd.DataFrame({
+                            'Date': prediction.index,
+                            'Price': prediction.values,
+                            'Type': 'Prediction'
+                        })
+                        
+                        # Combine historical and prediction data
+                        plot_df = pd.concat([hist_df, pred_df])
+                        
+                        # Create base chart
+                        base = alt.Chart(plot_df).encode(
+                            x=alt.X('Date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
+                            y=alt.Y('Price:Q', axis=alt.Axis(title='Price ($)', format='$.2f')),
+                            color=alt.Color('Type:N', scale=alt.Scale(
+                                domain=['Historical', 'Prediction'],
+                                range=['#1f77b4', '#ff7f0e']
+                            ))
+                        )
+                        
+                        # Create line chart
+                        lines = base.mark_line().encode(
+                            strokeDash=alt.condition(
+                                alt.datum.Type == 'Prediction',
+                                alt.value([5, 5]),  # dashed line for predictions
+                                alt.value([0])      # solid line for historical
+                            )
+                        )
+                        
+                        # Create points for better interactivity
+                        points = base.mark_circle(size=100).encode(
+                            opacity=alt.value(0),
+                            tooltip=[
+                                alt.Tooltip('Date:T', title='Date', format='%Y-%m-%d'),
+                                alt.Tooltip('Price:Q', title='Price', format='$.2f'),
+                                alt.Tooltip('Type:N', title='Type')
+                            ]
+                        )
+                        
+                        # Combine line and points
+                        chart = (lines + points).properties(
+                            width=700,
+                            height=400,
+                            title=f"{ticker} Stock Price Prediction"
+                        ).configure_axis(
+                            labelFontSize=12,
+                            titleFontSize=14
+                        ).configure_title(
+                            fontSize=16,
+                            anchor='middle'
+                        ).configure_legend(
+                            labelFontSize=12,
+                            titleFontSize=14
+                        ).interactive()
+                        
+                        # Display chart
+                        st.altair_chart(chart, use_container_width=True)
+                        
+                        # Show prediction details
+                        final_price = prediction.iloc[-1]
+                        price_change = ((final_price - current_price) / current_price) * 100
+                        
+                        st.subheader("Prediction Summary")
+                        st.write(f"Current Price: ${current_price:.2f}")
+                        st.write(f"Predicted Price ({prediction_days} days): ${final_price:.2f}")
+                        st.write(f"Predicted Change: {price_change:+.2f}%")
+                        
+                        # Generate CIO Letter
+                        if prediction is not None and len(prediction) > 0 and model_type in ["Ollama 3.2", "DeepSeek-R1"]:
+                            st.subheader("🎯 CIO Investment Letter")
+                            
+                            try:
+                                # Get current price and predicted price
+                                current_price = float(data['Close'].iloc[-1])
+                                final_price = float(prediction.iloc[-1])
+                                price_change = ((final_price - current_price) / current_price) * 100
+                                
+                                # Calculate technical indicators
+                                delta = data['Close'].diff()
+                                gain = (delta.where(delta > 0, 0)).fillna(0)
+                                loss = (-delta.where(delta < 0, 0)).fillna(0)
+                                avg_gain = gain.rolling(window=14).mean()
+                                avg_loss = loss.rolling(window=14).mean()
+                                rs = avg_gain / avg_loss
+                                data['RSI'] = 100 - (100 / (1 + rs))
+                                
+                                # Calculate MACD
+                                exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+                                exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+                                data['MACD'] = exp1 - exp2
+                                data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+                                
+                                # Calculate Moving Averages
+                                data['MA20'] = data['Close'].rolling(window=20).mean()
+                                data['MA50'] = data['Close'].rolling(window=50).mean()
+                                
+                                # Get latest values
+                                latest_data = {
+                                    'rsi': float(data['RSI'].iloc[-1]),
+                                    'macd': float(data['MACD'].iloc[-1]),
+                                    'signal': float(data['Signal'].iloc[-1]),
+                                    'ma20': float(data['MA20'].iloc[-1]),
+                                    'ma50': float(data['MA50'].iloc[-1]),
+                                    'volume': float(data['Volume'].iloc[-1]),
+                                    'avg_volume': float(data['Volume'].mean()),
+                                    'volume_trend': '+' if data['Volume'].tail(10).mean() > data['Volume'].tail(30).mean() else '-'
+                                }
+                                
+                                cio_prompt = f"""You are the Chief Investment Officer of a prestigious investment firm. Write a professional investment analysis letter for {ticker} stock.
 
-def buffett_analysis_tab():
-    """Buffett Analysis tab"""
-    try:
-        st.header("Buffett Analysis")
-        
-        # Stock input
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            ticker = st.text_input("Enter Stock Symbol:", "AAPL", key="buffett_ticker").upper()
-            
-        if ticker:
-            # Get stock data
-            data = get_stock_data(ticker)
-            
-            if data is not None:
-                # Get stock info
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                
-                # Call buffett analysis function with data
-                import buffett_analysis
-                buffett_analysis.display_analysis(ticker)
-            else:
-                st.error(f"Could not fetch data for {ticker}")
+                                Current Analysis Data:
+                                - Current Price: ${current_price:.2f}
+                                - Predicted Price (in {prediction_days} days): ${final_price:.2f}
+                                - Predicted Change: {price_change:+.2f}%
+                                
+                                Technical Indicators:
+                                - RSI: {latest_data['rsi']:.2f} ({'Overbought' if latest_data['rsi'] > 70 else 'Oversold' if latest_data['rsi'] < 30 else 'Neutral'})
+                                - MACD: {latest_data['macd']:.2f}
+                                - Signal Line: {latest_data['signal']:.2f}
+                                - 20-day MA: ${latest_data['ma20']:.2f}
+                                - 50-day MA: ${latest_data['ma50']:.2f}
+                                
+                                Volume Analysis:
+                                - Current Volume: {latest_data['volume']:,.0f}
+                                - Average Volume: {latest_data['avg_volume']:,.0f}
+                                - Volume Trend: {latest_data['volume_trend']}
+                                
+                                Write a detailed analysis covering:
+                                1. Executive Summary
+                                - Brief overview of current position
+                                - Key recommendation
+                                - Target price range
+                                
+                                2. Technical Analysis
+                                - RSI interpretation
+                                - MACD signal analysis
+                                - Moving average trends
+                                - Volume analysis
+                                
+                                3. Price Targets
+                                - Entry points (with specific prices)
+                                - Exit targets (with specific prices)
+                                - Stop loss levels (with specific prices)
+                                
+                                4. Risk Assessment
+                                - Market risks
+                                - Technical risks
+                                - Volatility analysis
+                                
+                                5. Investment Recommendation
+                                - Clear BUY/HOLD/SELL recommendation
+                                - Position sizing suggestion
+                                - Time horizon
+                                - Risk management rules
+                                
+                                Format with markdown for better readability.
+                                Be specific with numbers and percentages.
+                                Provide clear actionable recommendations.
+                                """
+                                
+                                with st.spinner("Generating CIO Investment Letter..."):
+                                    response = requests.post(
+                                        'http://localhost:11434/api/generate',
+                                        json={
+                                            "model": "llama2" if model_type == "Ollama 3.2" else "deepseek-coder",
+                                            "prompt": cio_prompt,
+                                            "stream": False
+                                        },
+                                        timeout=60
+                                    )
+                                    
+                                    if response.status_code == 200:
+                                        cio_letter = response.json()['response']
+                                        
+                                        # Add a professional header
+                                        st.markdown(f"""
+                                        <div style='text-align: center; margin-bottom: 20px;'>
+                                            <h3>Investment Analysis Report</h3>
+                                            <p style='color: gray;'>Generated on {datetime.now().strftime('%B %d, %Y')}</p>
+                                            <p style='color: gray;'>For: {ticker}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                        
+                                        # Display the analysis
+                                        st.markdown(cio_letter)
+                                        
+                                        # Add disclaimer
+                                        st.markdown("""
+                                        ---
+                                        *Disclaimer: This analysis is generated using artificial intelligence and should not be considered as financial advice. Always conduct your own research and consult with a qualified financial advisor before making investment decisions.*
+                                        """)
+                                    else:
+                                        st.error(f"Failed to generate CIO letter. Status code: {response.status_code}")
+                                        
+                            except Exception as e:
+                                st.error(f"Error in CIO letter generation: {str(e)}")
+                                st.write("Debug: Exception traceback:", traceback.format_exc())
+                    
+                except Exception as e:
+                    st.error(f"Error generating prediction: {str(e)}")
+                    
     except Exception as e:
-        st.error(f"Error in Buffett Analysis tab: {str(e)}")
-        logger.error(f"Error in Buffett Analysis tab: {str(e)}\n{traceback.format_exc()}")
-        
+        st.error(f"Unexpected error: {str(e)}")
+
+def main():
+    """Main function to run the stock analysis app"""
+    st.set_page_config(page_title="StockPro", layout="wide")
+    
+    st.title("StockPro - Advanced Stock Analysis")
+    
+    # Initialize session state
+    if 'ticker' not in st.session_state:
+        st.session_state['ticker'] = 'AAPL'
+        st.session_state['current_ticker'] = 'AAPL'  # For backwards compatibility
+    
+    # Stock input in main page
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        ticker = st.text_input(
+            "Enter Stock Symbol",
+            value=st.session_state['ticker'],
+            placeholder="e.g., AAPL",
+            help="Enter a valid stock symbol to analyze"
+        )
+    
+    # Update session state if ticker changes
+    if ticker != st.session_state['ticker']:
+        st.session_state['ticker'] = ticker.upper()
+        st.session_state['current_ticker'] = ticker.upper()  # For backwards compatibility
+        st.rerun()
+    
+    # Show current stock info if available
+    if st.session_state['ticker']:
+        try:
+            stock = yf.Ticker(st.session_state['ticker'])
+            info = stock.info
+            company_name = info.get('longName', st.session_state['ticker'])
+            current_price = info.get('regularMarketPrice', 0)
+            previous_close = info.get('previousClose', 0)
+            price_change = ((current_price - previous_close) / previous_close) * 100 if previous_close else 0
+            
+            with col2:
+                st.metric(
+                    "Current Price",
+                    f"${current_price:.2f}",
+                    f"{price_change:+.2f}%",
+                    delta_color="normal"
+                )
+            with col3:
+                market_cap = info.get('marketCap', 0)
+                st.metric("Market Cap", format_large_number(market_cap))
+            
+            st.markdown(f"### {company_name}")
+        except Exception as e:
+            if st.session_state['ticker']:
+                st.error(f"Error loading stock data: {str(e)}")
+    
+    # Create tabs with original structure
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "Company Profile",
+        "Technical Analysis",
+        "Stock Prediction",
+        "Buffett Analysis",
+        "Options Analysis",
+        "Market Movers"
+    ])
+    
+    with tab1:
+        company_profile_tab()
+    
+    with tab2:
+        technical_analysis_tab()
+    
+    with tab3:
+        prediction_tab()
+    
+    with tab4:
+        buffett_analysis_tab()
+    
+    with tab5:
+        options_analysis_tab()
+    
+    with tab6:
+        market_movers_tab()
+
 if __name__ == "__main__":
     main()

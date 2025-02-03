@@ -1,286 +1,250 @@
+"""Technical analysis module for StockPro"""
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from utils import calculate_rsi, calculate_macd
+from utils import calculate_rsi, calculate_macd, calculate_bollinger_bands
 
-def technical_analysis_tab(ticker, data):
-    """Technical analysis tab with customizable indicators"""
+def technical_analysis_tab():
+    """Technical analysis tab showing various technical indicators"""
     try:
-        st.subheader(f"Technical Analysis for {ticker}")
+        st.header("📊 Technical Analysis")
         
-        # Add indicator selection
-        indicators = st.multiselect(
-            "Select Technical Indicators",
-            ["Moving Averages", "RSI", "MACD", "Bollinger Bands", "Volume"],
-            default=["Moving Averages", "RSI"]
-        )
+        # Get ticker from session state
+        ticker = st.session_state.get('current_ticker', '')
+        if not ticker:
+            st.warning("Please enter a stock ticker above.")
+            return
+            
+        # Fetch stock data
+        try:
+            stock = yf.Ticker(ticker)
+            data = stock.history(period="1y")
+            
+            if data.empty:
+                st.error(f"Could not fetch data for {ticker}")
+                return
+                
+            # Calculate indicators
+            rsi = calculate_rsi(data)
+            macd_data = calculate_macd(data)
+            bb_data = calculate_bollinger_bands(data)
+            
+            # Create tabs for different indicators
+            tab1, tab2, tab3 = st.tabs(["Price & Volume", "RSI & MACD", "Bollinger Bands"])
+            
+            with tab1:
+                st.subheader("Price & Volume Analysis")
+                
+                # Price chart
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=data.index,
+                    open=data['Open'],
+                    high=data['High'],
+                    low=data['Low'],
+                    close=data['Close'],
+                    name='Price'
+                ))
+                
+                # Volume chart
+                fig.add_trace(go.Bar(
+                    x=data.index,
+                    y=data['Volume'],
+                    name='Volume',
+                    yaxis='y2'
+                ))
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"{ticker} Price and Volume",
+                    yaxis_title="Price ($)",
+                    yaxis2=dict(
+                        title="Volume",
+                        overlaying="y",
+                        side="right"
+                    ),
+                    xaxis_title="Date",
+                    height=600
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with tab2:
+                st.subheader("RSI & MACD")
+                
+                # RSI Plot
+                fig_rsi = go.Figure()
+                fig_rsi.add_trace(go.Scatter(
+                    x=data.index,
+                    y=rsi,
+                    name='RSI'
+                ))
+                
+                # Add overbought/oversold lines
+                fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="Overbought (70)")
+                fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="Oversold (30)")
+                
+                fig_rsi.update_layout(
+                    title=f"{ticker} RSI (14)",
+                    yaxis_title="RSI",
+                    xaxis_title="Date",
+                    height=300
+                )
+                
+                st.plotly_chart(fig_rsi, use_container_width=True)
+                
+                # MACD Plot
+                fig_macd = go.Figure()
+                fig_macd.add_trace(go.Scatter(
+                    x=data.index,
+                    y=macd_data['MACD'],
+                    name='MACD'
+                ))
+                fig_macd.add_trace(go.Scatter(
+                    x=data.index,
+                    y=macd_data['Signal'],
+                    name='Signal'
+                ))
+                fig_macd.add_trace(go.Bar(
+                    x=data.index,
+                    y=macd_data['Histogram'],
+                    name='Histogram'
+                ))
+                
+                fig_macd.update_layout(
+                    title=f"{ticker} MACD",
+                    yaxis_title="MACD",
+                    xaxis_title="Date",
+                    height=300
+                )
+                
+                st.plotly_chart(fig_macd, use_container_width=True)
+                
+            with tab3:
+                st.subheader("Bollinger Bands")
+                
+                fig_bb = go.Figure()
+                
+                # Add price
+                fig_bb.add_trace(go.Scatter(
+                    x=data.index,
+                    y=data['Close'],
+                    name='Price',
+                    line=dict(color='blue')
+                ))
+                
+                # Add Bollinger Bands
+                fig_bb.add_trace(go.Scatter(
+                    x=data.index,
+                    y=bb_data['Upper'],
+                    name='Upper Band',
+                    line=dict(color='gray', dash='dash')
+                ))
+                
+                fig_bb.add_trace(go.Scatter(
+                    x=data.index,
+                    y=bb_data['Lower'],
+                    name='Lower Band',
+                    line=dict(color='gray', dash='dash'),
+                    fill='tonexty'
+                ))
+                
+                fig_bb.update_layout(
+                    title=f"{ticker} Bollinger Bands",
+                    yaxis_title="Price ($)",
+                    xaxis_title="Date",
+                    height=600
+                )
+                
+                st.plotly_chart(fig_bb, use_container_width=True)
+                
+        except Exception as e:
+            st.error(f"Error fetching stock data: {str(e)}")
+            
+    except Exception as e:
+        st.error(f"Unexpected error: {str(e)}")
+
+def plot_daily_candlestick(ticker, data=None):
+    """Plot daily candlestick chart"""
+    try:
+        if data is None:
+            # Fetch data if not provided
+            stock = yf.Ticker(ticker)
+            data = stock.history(period="1y")
         
-        # Create figure with multiple subplots
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                          vertical_spacing=0.05,
-                          row_heights=[0.6, 0.2, 0.2],
-                          subplot_titles=('Price', 'RSI', 'MACD'))
-        
-        # Add candlestick chart
-        fig.add_trace(go.Candlestick(
+        fig = go.Figure(data=[go.Candlestick(
             x=data.index,
             open=data['Open'],
             high=data['High'],
             low=data['Low'],
-            close=data['Close'],
-            name='OHLC'
-        ), row=1, col=1)
+            close=data['Close']
+        )])
         
-        # Add selected indicators
-        if "Moving Averages" in indicators:
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['SMA20'],
-                name='20-day SMA',
-                line=dict(color='orange', width=1)
-            ), row=1, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['SMA50'],
-                name='50-day SMA',
-                line=dict(color='blue', width=1)
-            ), row=1, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['SMA200'],
-                name='200-day SMA',
-                line=dict(color='purple', width=1)
-            ), row=1, col=1)
+        fig.update_layout(
+            title=f"{ticker} Daily Price",
+            yaxis_title="Price",
+            xaxis_rangeslider_visible=False
+        )
         
-        if "RSI" in indicators:
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['RSI'],
-                name='RSI',
-                line=dict(color='purple', width=1)
-            ), row=2, col=1)
-            
-            # Add RSI levels
-            fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+        return fig
+    
+    except Exception as e:
+        st.error(f"Error plotting candlestick: {str(e)}")
+        return None
+
+def plot_stock_history(ticker, period='1y'):
+    """Plot historical stock data with multiple timeframes"""
+    try:
+        # Fetch stock data
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
         
-        if "MACD" in indicators:
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['MACD'],
-                name='MACD',
-                line=dict(color='blue', width=1)
-            ), row=3, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['Signal'],
-                name='Signal',
-                line=dict(color='orange', width=1)
-            ), row=3, col=1)
-            
-            fig.add_trace(go.Bar(
-                x=data.index,
-                y=data['MACD_Hist'],
-                name='MACD Histogram',
-                marker_color='gray'
-            ), row=3, col=1)
+        if hist.empty:
+            st.error(f"No data available for {ticker}")
+            return None
         
-        if "Volume" in indicators:
-            fig.add_trace(go.Bar(
-                x=data.index,
-                y=data['Volume'],
-                name='Volume',
-                marker_color='lightgray'
-            ), row=3, col=1)
-            
-        if "Bollinger Bands" in indicators:
-            # Calculate Bollinger Bands
-            period = 20
-            std_dev = 2
-            
-            data['BB_middle'] = data['Close'].rolling(window=period).mean()
-            data['BB_upper'] = data['BB_middle'] + (data['Close'].rolling(window=period).std() * std_dev)
-            data['BB_lower'] = data['BB_middle'] - (data['Close'].rolling(window=period).std() * std_dev)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['BB_upper'],
-                name='Upper BB',
-                line=dict(color='gray', width=1, dash='dash')
-            ), row=1, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['BB_middle'],
-                name='Middle BB',
-                line=dict(color='gray', width=1)
-            ), row=1, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=data['BB_lower'],
-                name='Lower BB',
-                line=dict(color='gray', width=1, dash='dash')
-            ), row=1, col=1)
+        # Create figure
+        fig = go.Figure()
+        
+        # Add candlestick
+        fig.add_trace(go.Candlestick(
+            x=hist.index,
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name=ticker
+        ))
+        
+        # Add volume bars
+        colors = ['red' if row['Open'] - row['Close'] >= 0 
+                 else 'green' for index, row in hist.iterrows()]
+        
+        fig.add_trace(go.Bar(
+            x=hist.index,
+            y=hist['Volume'],
+            name='Volume',
+            marker_color=colors,
+            yaxis="y2"
+        ))
         
         # Update layout
         fig.update_layout(
-            title=f'{ticker} Technical Analysis',
-            yaxis_title='Price (USD)',
-            yaxis2_title='RSI',
-            yaxis3_title='MACD/Volume',
-            xaxis_rangeslider_visible=False,
-            height=800
+            title=f"{ticker} Historical Data",
+            yaxis_title="Price",
+            yaxis2=dict(
+                title="Volume",
+                overlaying="y",
+                side="right"
+            ),
+            xaxis_rangeslider_visible=False
         )
         
-        # Update y-axes
-        fig.update_yaxes(title_text="Price", row=1, col=1)
-        fig.update_yaxes(title_text="RSI", row=2, col=1)
-        fig.update_yaxes(title_text="MACD/Volume", row=3, col=1)
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Display current indicator values
-        st.subheader("Current Technical Indicators")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("20-day SMA", f"${data['SMA20'].iloc[-1]:.2f}")
-            st.metric("50-day SMA", f"${data['SMA50'].iloc[-1]:.2f}")
-            
-        with col2:
-            st.metric("RSI", f"{data['RSI'].iloc[-1]:.1f}")
-            st.metric("200-day SMA", f"${data['SMA200'].iloc[-1]:.2f}")
-            
-        with col3:
-            st.metric("MACD", f"{data['MACD'].iloc[-1]:.3f}")
-            st.metric("Signal", f"{data['Signal'].iloc[-1]:.3f}")
-        
+        return fig
+    
     except Exception as e:
-        st.error(f"Error in technical analysis: {str(e)}")
-
-def plot_daily_candlestick(data):
-    """Plot daily candlestick chart with volume"""
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                       vertical_spacing=0.03, subplot_titles=('Price', 'Volume'),
-                       row_width=[0.7, 0.3])
-
-    fig.add_trace(go.Candlestick(x=data.index,
-                                open=data['Open'],
-                                high=data['High'],
-                                low=data['Low'],
-                                close=data['Close'],
-                                name='OHLC'),
-                 row=1, col=1)
-
-    fig.add_trace(go.Bar(x=data.index,
-                        y=data['Volume'],
-                        name='Volume'),
-                 row=2, col=1)
-
-    fig.update_layout(
-        title='Daily Trading Activity',
-        yaxis_title='Price (USD)',
-        yaxis2_title='Volume',
-        xaxis_rangeslider_visible=False,
-        height=800
-    )
-
-    return fig
-
-def plot_stock_history(data, indicators=None):
-    """Plot stock history with selected technical indicators"""
-    if indicators is None:
-        indicators = ['SMA20', 'SMA50', 'RSI', 'MACD']
-        
-    # Create figure with secondary y-axis
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                       vertical_spacing=0.05,
-                       row_heights=[0.6, 0.2, 0.2],
-                       subplot_titles=('Price', 'RSI', 'MACD'))
-
-    # Add candlestick
-    fig.add_trace(go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name='OHLC'
-    ), row=1, col=1)
-
-    # Add moving averages
-    if 'SMA20' in indicators:
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data['SMA20'],
-            name='20 SMA',
-            line=dict(color='orange')
-        ), row=1, col=1)
-
-    if 'SMA50' in indicators:
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data['SMA50'],
-            name='50 SMA',
-            line=dict(color='blue')
-        ), row=1, col=1)
-
-    # Add RSI
-    if 'RSI' in indicators:
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data['RSI'],
-            name='RSI',
-            line=dict(color='purple')
-        ), row=2, col=1)
-        
-        # Add RSI levels
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-
-    # Add MACD
-    if 'MACD' in indicators:
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data['MACD'],
-            name='MACD',
-            line=dict(color='blue')
-        ), row=3, col=1)
-        
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data['Signal'],
-            name='Signal',
-            line=dict(color='orange')
-        ), row=3, col=1)
-        
-        fig.add_trace(go.Bar(
-            x=data.index,
-            y=data['MACD_Hist'],
-            name='MACD Histogram',
-            marker_color='gray'
-        ), row=3, col=1)
-
-    # Update layout
-    fig.update_layout(
-        title='Technical Analysis',
-        yaxis_title='Price (USD)',
-        yaxis2_title='RSI',
-        yaxis3_title='MACD',
-        xaxis_rangeslider_visible=False,
-        height=800
-    )
-
-    # Update y-axes
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="RSI", row=2, col=1)
-    fig.update_yaxes(title_text="MACD", row=3, col=1)
-
-    return fig
+        st.error(f"Error plotting stock history: {str(e)}")
+        return None

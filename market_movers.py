@@ -4,6 +4,8 @@ import requests
 import ssl
 import certifi
 import logging
+import io
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ def get_market_movers():
         def get_data(url):
             response = session.get(url)
             response.raise_for_status()
-            df = pd.read_html(response.text)[0]
+            df = pd.read_html(io.StringIO(response.text))[0]
             
             # Print column names for debugging
             logger.info(f"Columns in dataframe: {df.columns.tolist()}")
@@ -179,99 +181,41 @@ def display_movers_table(df, category):
         logger.error(f"Error displaying {category} table: {str(e)}")
         st.error(f"Error displaying {category} table: {str(e)}")
 
-def market_movers_tab(section=None):
-    """Market movers tab with sections"""
+def market_movers_tab():
+    """Display market movers data"""
     try:
+        st.header("Market Movers")
+        
         # Get market movers data
         gainers, losers, active = get_market_movers()
         
-        if section == "gainers":
-            display_movers_table(gainers, "gainers")
+        # Create tabs for different categories
+        gainers_tab, losers_tab, active_tab = st.tabs(["Top Gainers", "Top Losers", "Most Active"])
+        
+        # Display top gainers
+        with gainers_tab:
+            st.markdown("### 📈 Top Gainers")
             if gainers is not None:
-                st.metric("Average Gain", f"{gainers['% Change'].mean():+.2f}%")
-                
-        elif section == "losers":
-            display_movers_table(losers, "losers")
+                display_movers_table(gainers, "Top Gainers")
+            else:
+                st.error("Unable to fetch gainers")
+        
+        # Display top losers
+        with losers_tab:
+            st.markdown("### 📉 Top Losers")
             if losers is not None:
-                st.metric("Average Loss", f"{losers['% Change'].mean():+.2f}%")
-                
-        elif section == "active":
-            display_movers_table(active, "most active")
+                display_movers_table(losers, "Top Losers")
+            else:
+                st.error("Unable to fetch losers")
+        
+        # Display most active
+        with active_tab:
+            st.markdown("### 📊 Most Active")
             if active is not None:
-                st.metric("Total Volume", f"{active['Volume'].sum():,.0f}")
-                
-        else:
-            # Add stock input and analyze button
-            col1, col2, col3 = st.columns([3, 1, 1])
-            with col1:
-                ticker = st.text_input("Enter Stock Symbol:", key="market_movers_ticker").upper()
-            with col2:
-                analyze = st.button("Analyze")
-            with col3:
-                refresh = st.button("Refresh Data")
+                display_movers_table(active, "Most Active")
+            else:
+                st.error("Unable to fetch active")
             
-            # Market Summary
-            if gainers is not None and losers is not None and active is not None:
-                st.markdown("---")
-                st.subheader("Market Summary")
-                summary_col1, summary_col2, summary_col3 = st.columns(3)
-                
-                with summary_col1:
-                    st.metric("Average Gain", f"{gainers['% Change'].mean():+.2f}%")
-                    
-                with summary_col2:
-                    st.metric("Average Loss", f"{losers['% Change'].mean():+.2f}%")
-                    
-                with summary_col3:
-                    st.metric("Total Volume", f"{active['Volume'].sum():,.0f}")
-            
-            # Display individual stock analysis if requested
-            if ticker and analyze:
-                st.markdown("---")
-                st.subheader(f"Analysis for {ticker}")
-                
-                try:
-                    # Check if stock is in any of our lists
-                    in_gainers = ticker in gainers['Symbol'].values if gainers is not None else False
-                    in_losers = ticker in losers['Symbol'].values if losers is not None else False
-                    in_active = ticker in active['Symbol'].values if active is not None else False
-                    
-                    if in_gainers:
-                        stock_data = gainers[gainers['Symbol'] == ticker].iloc[0]
-                        category = "Top Gainers"
-                    elif in_losers:
-                        stock_data = losers[losers['Symbol'] == ticker].iloc[0]
-                        category = "Top Losers"
-                    elif in_active:
-                        stock_data = active[active['Symbol'] == ticker].iloc[0]
-                        category = "Most Active"
-                    else:
-                        st.warning(f"{ticker} is not in today's market movers list")
-                        return
-                        
-                    # Display stock details
-                    detail_col1, detail_col2 = st.columns(2)
-                    
-                    with detail_col1:
-                        st.markdown(f"""
-                        **Category:** {category}
-                        **Company:** {stock_data['Name']}
-                        **Current Price:** ${stock_data['Price']:.2f}
-                        """)
-                        
-                    with detail_col2:
-                        st.markdown(f"""
-                        **% Change:** {stock_data['% Change']:+.2f}%
-                        **Volume:** {stock_data['Volume']:,.0f}
-                        **Market Cap:** {format_market_cap(stock_data['Market Cap'])}
-                        """)
-                        
-                except Exception as e:
-                    logger.error(f"Error analyzing stock {ticker}: {str(e)}")
-                    st.error(f"Error analyzing {ticker}. Please try again.")
-                    
     except Exception as e:
-        logger.error(f"Error in market movers tab: {str(e)}")
-        st.error("Error loading market movers. Please try refreshing the page.")
-
-market_movers_tab()
+        logger.error(f"Error in market movers tab: {str(e)}\n{traceback.format_exc()}")
+        st.error(f"Error loading market movers data: {str(e)}")

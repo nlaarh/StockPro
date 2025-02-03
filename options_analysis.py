@@ -14,19 +14,37 @@ def get_options_chain(ticker):
         stock = yf.Ticker(ticker)
         
         # Get options expiration dates
-        expirations = stock.options
+        try:
+            expirations = stock.options
+        except:
+            # Retry with force=True to bypass cache
+            stock = yf.Ticker(ticker, session=None)
+            expirations = stock.options
         
         if not expirations:
-            st.warning(f"No options data available for {ticker}")
+            st.warning("""
+            No options data available. This could be due to:
+            1. Market hours (options data may be delayed outside market hours)
+            2. Data provider limitations
+            3. No options trading for this stock
+            
+            Try again in a few minutes or during market hours.
+            """)
             return None, None, None
             
         # Get nearest expiration date
         expiration = expirations[0]
         
-        # Get options chain
-        opt = stock.option_chain(expiration)
+        # Get options chain with retry
+        try:
+            opt = stock.option_chain(expiration)
+        except:
+            # Retry with force=True
+            stock = yf.Ticker(ticker, session=None)
+            opt = stock.option_chain(expiration)
+            
         if not hasattr(opt, 'calls') or not hasattr(opt, 'puts'):
-            st.warning(f"Invalid options data for {ticker}")
+            st.warning(f"Invalid options data structure for {ticker}")
             return None, None, None
         
         # Add expiration date to both DataFrames
@@ -298,125 +316,243 @@ def get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy,
         return None
 
 
-def options_analysis_tab(ticker):
-    """Display options analysis and trading strategies"""
-    st.write("Options Analysis")
-    
+def display_analysis(ticker):
+    """Display options analysis"""
     try:
         st.subheader(f"Options Analysis for {ticker}")
         
-        # Get stock data
-        stock = yf.Ticker(ticker)
-        data = stock.history(period="1y")
-        if data.empty:
-            st.error(f"No historical data available for {ticker}")
+        # Get stock data and options chain
+        calls, puts, expiration = get_options_chain(ticker)
+        if calls is None or puts is None:
             return
             
-        current_price = data['Close'].iloc[-1]
-        
-        # Calculate technical indicators
-        rsi_data = calculate_rsi(data)
-        if rsi_data.empty:
-            st.warning("Could not calculate RSI. Using default values.")
-            rsi = 50  # Neutral RSI value
-        else:
-            rsi = float(rsi_data.iloc[-1].values[0])  # Extract scalar value properly
+        # Get current price and other metrics
+        current_price = get_current_price(ticker)
+        if current_price is None:
+            st.error(f"Could not get current price for {ticker}")
+            return
             
-        volatility = data['Close'].pct_change().std() * np.sqrt(252)  # Annualized volatility
+        # Create metrics columns
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric(
+                "Current Price",
+                f"${current_price:.2f}"
+            )
+            
+        with col2:
+            iv = get_implied_volatility(ticker)
+            st.metric(
+                "Implied Volatility",
+                f"{iv:.1f}%" if iv else "N/A"
+            )
+            
+        with col3:
+            cp_ratio = get_call_put_ratio(ticker)
+            st.metric(
+                "Call/Put Ratio",
+                f"{cp_ratio:.2f}" if cp_ratio else "N/A"
+            )
+            
+        # Display options chain
+        st.subheader("Options Chain")
+        
+        # Format options chain for display
+        def format_chain(chain, option_type):
+            if chain is not None and not chain.empty:
+                # Select and rename columns
+                display_cols = {
+                    'strike': 'Strike',
+                    'lastPrice': 'Last',
+                    'bid': 'Bid',
+                    'ask': 'Ask',
+                    'volume': 'Volume',
+                    'openInterest': 'Open Int',
+                    'impliedVolatility': 'IV'
+                }
+                
+                chain_display = chain[display_cols.keys()].copy()
+                chain_display.columns = display_cols.values()
+                
+                # Format numeric columns
+                chain_display['Strike'] = chain_display['Strike'].map('${:,.2f}'.format)
+                chain_display['Last'] = chain_display['Last'].map('${:,.2f}'.format)
+                chain_display['Bid'] = chain_display['Bid'].map('${:,.2f}'.format)
+                chain_display['Ask'] = chain_display['Ask'].map('${:,.2f}'.format)
+                chain_display['IV'] = chain_display['IV'].map('{:.1%}'.format)
+                
+                return chain_display
+            return pd.DataFrame()
+            
+        # Create tabs for calls and puts
+        call_tab, put_tab = st.tabs(["Calls", "Puts"])
+        
+        with call_tab:
+            st.dataframe(
+                format_chain(calls, 'call'),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+        with put_tab:
+            st.dataframe(
+                format_chain(puts, 'put'),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+        # Calculate and display max pain
+        max_pain = calculate_max_pain(calls, puts)
+        if max_pain:
+            st.metric("Max Pain", f"${max_pain:.2f}")
+            
+        # Display options sentiment
+        sentiment = analyze_options_sentiment(iv, cp_ratio, current_price, max_pain)
+        if sentiment:
+            st.markdown(f"### Market Sentiment\n{sentiment}")
+            
+    except Exception as e:
+        st.error(f"Error displaying options analysis: {str(e)}")
+
+
+def calculate_max_pain(calls, puts):
+    """Calculate the max pain point"""
+    try:
+        strikes = sorted(set(calls['strike'].tolist() + puts['strike'].tolist()))
+        
+        # Calculate total value for each strike
+        pain = []
+        for strike in strikes:
+            # Calculate call pain
+            call_pain = sum(
+                max(0, strike - k) * v 
+                for k, v in zip(calls['strike'], calls['openInterest'])
+                if k <= strike
+            )
+            
+            # Calculate put pain
+            put_pain = sum(
+                max(0, k - strike) * v 
+                for k, v in zip(puts['strike'], puts['openInterest'])
+                if k >= strike
+            )
+            
+            pain.append(call_pain + put_pain)
+            
+        # Return strike price with minimum pain
+        return strikes[pain.index(min(pain))]
+    except:
+        return 0
+
+def analyze_options_sentiment(iv, cp_ratio, current_price, max_pain):
+    """Analyze overall options market sentiment"""
+    # Score different factors
+    scores = []
+    
+    # Implied volatility
+    if iv > 50:
+        scores.append("High implied volatility suggests significant uncertainty")
+    elif iv > 30:
+        scores.append("Moderate implied volatility indicates normal market conditions")
+    else:
+        scores.append("Low implied volatility suggests stable price expectations")
+    
+    # Call/put ratio
+    if cp_ratio > 1.5:
+        scores.append("Strong bullish sentiment from call/put ratio")
+    elif cp_ratio < 0.5:
+        scores.append("Strong bearish sentiment from call/put ratio")
+    else:
+        scores.append("Neutral sentiment from call/put ratio")
+    
+    # Max pain
+    pain_diff = ((current_price / max_pain - 1) * 100) if max_pain > 0 else 0
+    if abs(pain_diff) < 2:
+        scores.append("Price near max pain point suggests potential consolidation")
+    elif pain_diff > 0:
+        scores.append(f"Price {pain_diff:.1f}% above max pain may face resistance")
+    else:
+        scores.append(f"Price {-pain_diff:.1f}% below max pain may find support")
+    
+    return "\n".join(scores)
+
+def get_current_price(ticker):
+    """Get current stock price"""
+    try:
+        stock = yf.Ticker(ticker)
+        # Try different price fields in order of preference
+        price = (
+            stock.info.get('currentPrice') or 
+            stock.info.get('regularMarketPrice') or
+            stock.info.get('previousClose') or
+            stock.history(period='1d')['Close'].iloc[-1]
+        )
+        return price
+    except Exception as e:
+        st.error(f"Error getting price: {str(e)}")
+        return None
+
+def get_implied_volatility(ticker):
+    """Calculate average implied volatility from options chain"""
+    try:
+        stock = yf.Ticker(ticker)
+        # Get options expiration dates
+        expirations = stock.options
+        
+        if not expirations:
+            return 0
+            
+        # Get nearest expiration date
+        nearest_exp = expirations[0]
+        
+        # Get options chain for nearest expiration
+        calls = stock.option_chain(nearest_exp).calls
+        puts = stock.option_chain(nearest_exp).puts
+        
+        # Calculate average implied volatility
+        call_iv = calls['impliedVolatility'].mean() * 100
+        put_iv = puts['impliedVolatility'].mean() * 100
+        
+        return (call_iv + put_iv) / 2
+    except:
+        return 0
+
+def get_call_put_ratio(ticker):
+    """Calculate call/put ratio based on volume"""
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = stock.options
+        
+        if not expirations:
+            return 1.0
+            
+        # Get nearest expiration date
+        nearest_exp = expirations[0]
         
         # Get options chain
-        calls, puts, expiration = get_options_chain(ticker)
+        calls = stock.option_chain(nearest_exp).calls
+        puts = stock.option_chain(nearest_exp).puts
         
-        if calls is None or puts is None or expiration is None:
-            st.warning("Unable to analyze options. Please try a different stock.")
-            return
-            
-        # Get options strategy
-        strategy = get_options_strategy(ticker, current_price, rsi, volatility)
+        # Calculate total volume
+        call_volume = calls['volume'].sum()
+        put_volume = puts['volume'].sum()
         
-        if strategy:
-            # Create three columns for metrics
-            col1, col2, col3 = st.columns(3)
+        if put_volume == 0:
+            return 1.0
             
-            with col1:
-                st.metric("Current Price", f"${current_price:.2f}")
-                
-            with col2:
-                st.metric("RSI", f"{rsi:.1f}", 
-                    delta="Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral",
-                    delta_color="inverse")
-                
-            with col3:
-                st.metric("Volatility", f"{volatility:.1%}",
-                    delta="High" if volatility > 0.3 else "Low",
-                    delta_color="off")
-            
-            # Display strategy recommendation
-            st.markdown("### 📈 Strategy Recommendation")
-            rec_col1, rec_col2 = st.columns([1, 2])
-            
-            with rec_col1:
-                st.info(f"**Strategy:** {strategy['name']}")
-                st.warning(f"**Risk Level:** {strategy['risk_level']}")
-                
-            with rec_col2:
-                st.write(f"**Description:** {strategy['description']}")
-            
-            # Display options chains
-            st.markdown("### 📊 Options Chain Analysis")
-            st.markdown("""
-            <small>🟢 In-The-Money (ITM) options are highlighted in green.</small>
-            """, unsafe_allow_html=True)
-            
-            tab1, tab2 = st.tabs(["📈 Calls", "📉 Puts"])
-            
-            with tab1:
-                st.write("#### Call Options")
-                st.dataframe(calls.style.apply(
-                    lambda x: ['background-color: #90EE90' if x['inTheMoney'] else '' for i in x],
-                    axis=1
-                ))
-                
-            with tab2:
-                st.write("#### Put Options")
-                st.dataframe(puts.style.apply(
-                    lambda x: ['background-color: #90EE90' if x['inTheMoney'] else '' for i in x],
-                    axis=1
-                ))
-            
-            # Display risk analysis
-            st.markdown("### ⚠️ Risk Analysis")
-            
-            # Calculate days to nearest expiration
-            exp_date = pd.to_datetime(expiration)
-            days_to_exp = (exp_date - pd.Timestamp.now()).days
-            
-            risk_col1, risk_col2 = st.columns(2)
-            
-            with risk_col1:
-                st.metric("Days to Expiration", days_to_exp,
-                    delta="Short-term" if days_to_exp < 30 else "Long-term",
-                    delta_color="off")
-                st.metric("Implied Volatility Rank", 
-                    f"{percentileofscore(data['Close'].pct_change().rolling(30).std(), volatility):.0f}%")
-                
-            with risk_col2:
-                st.metric("Break-even Price", f"${current_price + calls['impliedVolatility'].mean():.2f}")
-                st.metric("Max Loss", "Limited" if strategy['risk_level'] != "High" else "Unlimited",
-                    delta=strategy['risk_level'],
-                    delta_color="inverse")
-            
-            # Display analyst letter
-            with st.expander("View Detailed Analyst Letter from CIO Nour Laaroubi"):
-                letter = get_options_analyst_letter(ticker, current_price, rsi, volatility, strategy, calls, puts, expiration)
-                if letter:
-                    st.markdown(letter)
-                else:
-                    st.warning("Could not generate analyst letter")
-                    
-    except Exception as e:
-        st.error(f"Error in options analysis tab: {str(e)}")
-        import traceback
-        st.error(traceback.format_exc())
+        return call_volume / put_volume
+    except:
+        return 1.0
 
-st.write("Options Analysis")
+def options_analysis_tab():
+    """Display options analysis and trading strategies"""
+    st.subheader("Options Analysis")
+    
+    # Get ticker from session state
+    ticker = st.session_state.ticker
+    
+    if ticker:
+        display_analysis(ticker)
+    else:
+        st.warning("Please enter a stock symbol to analyze options.")

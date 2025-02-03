@@ -3,9 +3,269 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
-import json
+from datetime import datetime, timedelta
 import requests
-from utils import calculate_rsi, calculate_macd
+import json
+import logging
+from utils import format_large_number, calculate_rsi, calculate_macd, calculate_bollinger_bands
+
+logger = logging.getLogger(__name__)
+
+def get_top_stocks():
+    """Get list of top stocks to analyze"""
+    # List of major stocks to analyze
+    stocks = [
+        'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSM', 'AVGO',
+        'ASML', 'ORCL', 'CSCO', 'ADBE', 'CRM', 'AMD', 'QCOM', 'INTC',
+        'TXN', 'IBM', 'NOW', 'SAP', 'SHOP', 'SQ', 'PYPL', 'V', 'MA',
+        'JPM', 'BAC', 'WFC', 'GS', 'MS'
+    ]
+    return stocks
+
+def analyze_stock(ticker):
+    """Analyze a single stock and return its metrics"""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Get historical data
+        hist = stock.history(period='1y')
+        
+        if hist.empty:
+            return None
+            
+        current_price = hist['Close'].iloc[-1]
+        prev_price = hist['Close'].iloc[-2]
+        price_change = ((current_price - prev_price) / prev_price) * 100
+        
+        # Calculate technical indicators
+        rsi = calculate_rsi(hist['Close'])[-1]
+        macd, signal, _ = calculate_macd(hist['Close'])
+        macd_value = macd.iloc[-1]
+        signal_value = signal.iloc[-1]
+        upper, middle, lower = calculate_bollinger_bands(hist['Close'])
+        
+        # Get fundamental metrics
+        market_cap = info.get('marketCap', 0)
+        pe_ratio = info.get('trailingPE', 0)
+        pb_ratio = info.get('priceToBook', 0)
+        dividend_yield = info.get('dividendYield', 0) * 100 if info.get('dividendYield') else 0
+        
+        return {
+            'Ticker': ticker,
+            'Company': info.get('longName', ticker),
+            'Price': current_price,
+            'Change %': price_change,
+            'Market Cap': market_cap,
+            'P/E Ratio': pe_ratio,
+            'P/B Ratio': pb_ratio,
+            'RSI': rsi,
+            'MACD': macd_value,
+            'Signal': signal_value,
+            'Dividend Yield': dividend_yield,
+            'Sector': info.get('sector', 'Unknown'),
+            'Industry': info.get('industry', 'Unknown'),
+            'Description': info.get('longBusinessSummary', '')
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing {ticker}: {str(e)}")
+        return None
+
+def get_stock_recommendations(model="ollama"):
+    """Get stock recommendations using specified model"""
+    try:
+        stocks = get_top_stocks()
+        analyzed_stocks = []
+        
+        # Analyze each stock
+        for ticker in stocks:
+            metrics = analyze_stock(ticker)
+            if metrics:
+                analyzed_stocks.append(metrics)
+        
+        if not analyzed_stocks:
+            return []
+            
+        # Convert to DataFrame for easier analysis
+        df = pd.DataFrame(analyzed_stocks)
+        
+        # Calculate composite score
+        df['Technical Score'] = (
+            (df['RSI'].between(30, 70).astype(int) * 0.3) +
+            ((df['MACD'] > df['Signal']).astype(int) * 0.4) +
+            (df['Change %'].gt(0).astype(int) * 0.3)
+        ) * 100
+        
+        df['Fundamental Score'] = (
+            (df['P/E Ratio'].between(0, 30).astype(int) * 0.4) +
+            (df['P/B Ratio'].between(0, 5).astype(int) * 0.3) +
+            (df['Dividend Yield'].gt(0).astype(int) * 0.3)
+        ) * 100
+        
+        df['Total Score'] = df['Technical Score'] * 0.5 + df['Fundamental Score'] * 0.5
+        
+        # Sort by total score
+        df = df.sort_values('Total Score', ascending=False)
+        
+        # Get top 5 recommendations
+        top_5 = df.head()
+        
+        recommendations = []
+        for _, stock in top_5.iterrows():
+            recommendations.append({
+                'Ticker': stock['Ticker'],
+                'Company': stock['Company'],
+                'Price': stock['Price'],
+                'Change %': stock['Change %'],
+                'Market Cap': stock['Market Cap'],
+                'Score': stock['Total Score'],
+                'Technical Score': stock['Technical Score'],
+                'Fundamental Score': stock['Fundamental Score'],
+                'Sector': stock['Sector'],
+                'Industry': stock['Industry'],
+                'Description': stock['Description']
+            })
+        
+        return recommendations
+        
+    except Exception as e:
+        logger.error(f"Error getting recommendations: {str(e)}")
+        return []
+
+def plot_stock_analysis(ticker):
+    """Create detailed analysis chart for a stock"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period='1y')
+        
+        if hist.empty:
+            return None
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Add candlestick chart
+        fig.add_trace(go.Candlestick(
+            x=hist.index,
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name='Price'
+        ))
+        
+        # Add volume bars
+        fig.add_trace(go.Bar(
+            x=hist.index,
+            y=hist['Volume'],
+            name='Volume',
+            yaxis='y2',
+            opacity=0.3
+        ))
+        
+        # Calculate and add technical indicators
+        upper, middle, lower = calculate_bollinger_bands(hist['Close'])
+        fig.add_trace(go.Scatter(x=hist.index, y=upper, name='Upper BB', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=hist.index, y=middle, name='Middle BB', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=hist.index, y=lower, name='Lower BB', line=dict(dash='dash')))
+        
+        # Update layout
+        fig.update_layout(
+            title=f'{ticker} Analysis',
+            yaxis_title='Price',
+            yaxis2=dict(
+                title='Volume',
+                overlaying='y',
+                side='right'
+            ),
+            xaxis_title='Date',
+            height=600,
+            showlegend=True
+        )
+        
+        return fig
+        
+    except Exception as e:
+        logger.error(f"Error plotting analysis for {ticker}: {str(e)}")
+        return None
+
+def stock_recommendations_tab():
+    """Display stock recommendations tab"""
+    st.subheader("Stock Recommendations")
+    
+    # Create tabs
+    tab1, tab2 = st.tabs(["Top Recommendations", "Detailed Analysis"])
+    
+    with tab1:
+        # Model selection
+        model = st.selectbox(
+            "Select Analysis Model",
+            ["ollama", "deepseek"],
+            help="Choose the model to generate stock recommendations"
+        )
+        
+        # Get recommendations
+        recommendations = get_stock_recommendations(model)
+        
+        if recommendations:
+            # Display recommendations table
+            st.markdown("### Top 5 Stock Recommendations")
+            
+            for i, rec in enumerate(recommendations, 1):
+                with st.expander(f"{i}. {rec['Company']} ({rec['Ticker']})"):
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Price", f"${rec['Price']:.2f}", f"{rec['Change %']:.1f}%")
+                    with col2:
+                        st.metric("Market Cap", format_large_number(rec['Market Cap']))
+                    with col3:
+                        st.metric("Total Score", f"{rec['Score']:.1f}")
+                    
+                    st.markdown("#### Company Details")
+                    st.markdown(f"**Sector:** {rec['Sector']}")
+                    st.markdown(f"**Industry:** {rec['Industry']}")
+                    st.markdown("#### Analysis Scores")
+                    st.markdown(f"- Technical Score: {rec['Technical Score']:.1f}")
+                    st.markdown(f"- Fundamental Score: {rec['Fundamental Score']:.1f}")
+                    st.markdown("#### Business Description")
+                    st.markdown(rec['Description'][:500] + "...")
+        else:
+            st.warning("Could not generate recommendations. Please try again.")
+    
+    with tab2:
+        if recommendations:
+            # Stock selector
+            selected_ticker = st.selectbox(
+                "Select Stock for Detailed Analysis",
+                [rec['Ticker'] for rec in recommendations]
+            )
+            
+            if selected_ticker:
+                # Display detailed analysis
+                fig = plot_stock_analysis(selected_ticker)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                # Get stock info
+                stock = yf.Ticker(selected_ticker)
+                info = stock.info
+                
+                # Display key statistics
+                st.markdown("### Key Statistics")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Market Cap", format_large_number(info.get('marketCap', 0)))
+                    st.metric("P/E Ratio", f"{info.get('trailingPE', 0):.2f}")
+                with col2:
+                    st.metric("52W High", f"${info.get('fiftyTwoWeekHigh', 0):.2f}")
+                    st.metric("52W Low", f"${info.get('fiftyTwoWeekLow', 0):.2f}")
+                with col3:
+                    st.metric("Dividend Yield", f"{info.get('dividendYield', 0) * 100:.2f}%")
+                    st.metric("Beta", f"{info.get('beta', 0):.2f}")
+        else:
+            st.warning("Please generate recommendations first.")
 
 def test_ollama_connection(model_type):
     """Test connection to Ollama server and model availability"""
@@ -27,7 +287,7 @@ def test_ollama_connection(model_type):
     except requests.exceptions.RequestException:
         return False, "Could not connect to Ollama server"
 
-def get_stock_recommendations(model_type="Ollama 3.2"):
+def get_stock_recommendations_ollama(model_type="Ollama 3.2"):
     """Get top 5 stock recommendations using LLM analysis"""
     try:
         # Test model availability
@@ -239,103 +499,101 @@ def get_analyst_writeup(ticker, model_type="Ollama 3.2"):
 def recommendations_tab():
     """Stock recommendations tab with detailed analysis"""
     try:
-        st.header("🎯 Top Stock Picks")
+        st.header("Top Stock Picks")
         
-        # Model selection
-        col1, col2 = st.columns([2, 3])
-        with col1:
-            model_type = st.selectbox(
-                "Select Analysis Model",
-                ["Ollama 3.2", "DeepSeek-R1"],
-                key="rec_model"
-            )
+        # Add model selection
+        model_type = st.selectbox(
+            "Select Model",
+            ["Ollama 3.2", "DeepSeek-R1"],
+            index=0,
+            help="Choose a model for stock recommendations"
+        )
         
-        # Get recommendations
-        if st.button("Get Recommendations", key="get_rec"):
-            with st.spinner("Generating stock recommendations..."):
-                recommendations = get_stock_recommendations(model_type)
+        # Get recommendations using selected model
+        with st.spinner("Generating stock recommendations..."):
+            recommendations = get_stock_recommendations_ollama(model_type)
+            
+            if recommendations:
+                # Create tabs for different views
+                summary_tab, detail_tab = st.tabs(["Summary View", "Detailed Analysis"])
                 
-                if recommendations:
-                    # Create tabs for different views
-                    summary_tab, detail_tab = st.tabs(["Summary View", "Detailed Analysis"])
+                with summary_tab:
+                    # Create a summary table
+                    summary_data = []
+                    for rec in recommendations:
+                        summary_data.append({
+                            "Ticker": rec['ticker'],
+                            "Company": rec['company'],
+                            "Sector": rec['sector'],
+                            "Risk": rec['risk'],
+                            "Target Range": f"${rec['target_range']['low']} - ${rec['target_range']['high']}"
+                        })
                     
-                    with summary_tab:
-                        # Create a summary table
-                        summary_data = []
-                        for rec in recommendations:
-                            summary_data.append({
-                                "Ticker": rec['ticker'],
-                                "Company": rec['company'],
-                                "Sector": rec['sector'],
-                                "Risk": rec['risk'],
-                                "Target Range": f"${rec['target_range']['low']} - ${rec['target_range']['high']}"
-                            })
-                        
-                        summary_df = pd.DataFrame(summary_data)
-                        st.dataframe(
-                            summary_df,
-                            column_config={
-                                "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                                "Company": st.column_config.TextColumn("Company", width="medium"),
-                                "Sector": st.column_config.TextColumn("Sector", width="medium"),
-                                "Risk": st.column_config.TextColumn("Risk", width="small"),
-                                "Target Range": st.column_config.TextColumn("Target Range", width="medium")
-                            },
-                            hide_index=True,
-                            use_container_width=True
-                        )
-                    
-                    with detail_tab:
-                        # Create detailed analysis for each stock
-                        for i, rec in enumerate(recommendations, 1):
-                            with st.expander(f"#{i}: {rec['ticker']} - {rec['company']}", expanded=i==1):
-                                col1, col2 = st.columns([2, 1])
+                    summary_df = pd.DataFrame(summary_data)
+                    st.dataframe(
+                        summary_df,
+                        column_config={
+                            "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                            "Company": st.column_config.TextColumn("Company", width="medium"),
+                            "Sector": st.column_config.TextColumn("Sector", width="medium"),
+                            "Risk": st.column_config.TextColumn("Risk", width="small"),
+                            "Target Range": st.column_config.TextColumn("Target Range", width="medium")
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                
+                with detail_tab:
+                    # Create detailed analysis for each stock
+                    for i, rec in enumerate(recommendations, 1):
+                        with st.expander(f"#{i}: {rec['ticker']} - {rec['company']}", expanded=i==1):
+                            col1, col2 = st.columns([2, 1])
+                            
+                            with col1:
+                                st.subheader("Investment Summary")
+                                st.write(f"**Sector:** {rec['sector']}")
+                                st.write(f"**Risk Level:** {rec['risk']}")
+                                st.write("**Key Points:**")
+                                for point in rec['points']:
+                                    st.write(f"• {point}")
                                 
-                                with col1:
-                                    st.subheader("Investment Summary")
-                                    st.write(f"**Sector:** {rec['sector']}")
-                                    st.write(f"**Risk Level:** {rec['risk']}")
-                                    st.write("**Key Points:**")
-                                    for point in rec['points']:
-                                        st.write(f"• {point}")
-                                    
-                                with col2:
-                                    try:
-                                        # Get real-time stock data
-                                        stock = yf.Ticker(rec['ticker'])
-                                        history = stock.history(period="1d")
-                                        if not history.empty:
-                                            current_price = history['Close'].iloc[-1]
-                                            
-                                            # Calculate potential returns
-                                            low_return = (rec['target_range']['low'] / current_price - 1) * 100
-                                            high_return = (rec['target_range']['high'] / current_price - 1) * 100
-                                            
-                                            st.metric("Current Price", f"${current_price:.2f}")
-                                            st.metric("Target Range", 
-                                                    f"${rec['target_range']['low']:.2f} - ${rec['target_range']['high']:.2f}",
-                                                    f"{low_return:.1f}% to {high_return:.1f}%")
-                                        else:
-                                            st.warning(f"Could not fetch current price for {rec['ticker']}")
-                                            st.metric("Target Range", 
-                                                    f"${rec['target_range']['low']:.2f} - ${rec['target_range']['high']:.2f}")
-                                    except Exception as e:
-                                        st.warning(f"Error getting price data for {rec['ticker']}: {str(e)}")
+                            with col2:
+                                try:
+                                    # Get real-time stock data
+                                    stock = yf.Ticker(rec['ticker'])
+                                    history = stock.history(period="1d")
+                                    if not history.empty:
+                                        current_price = history['Close'].iloc[-1]
+                                        
+                                        # Calculate potential returns
+                                        low_return = (rec['target_range']['low'] / current_price - 1) * 100
+                                        high_return = (rec['target_range']['high'] / current_price - 1) * 100
+                                        
+                                        st.metric("Current Price", f"${current_price:.2f}")
+                                        st.metric("Target Range", 
+                                                f"${rec['target_range']['low']:.2f} - ${rec['target_range']['high']:.2f}",
+                                                f"{low_return:.1f}% to {high_return:.1f}%")
+                                    else:
+                                        st.warning(f"Could not fetch current price for {rec['ticker']}")
                                         st.metric("Target Range", 
                                                 f"${rec['target_range']['low']:.2f} - ${rec['target_range']['high']:.2f}")
+                                except Exception as e:
+                                    st.warning(f"Error getting price data for {rec['ticker']}: {str(e)}")
+                                    st.metric("Target Range", 
+                                            f"${rec['target_range']['low']:.2f} - ${rec['target_range']['high']:.2f}")
+                            
+                            # Add technical chart
+                            st.subheader("Technical Analysis")
+                            chart = plot_stock_history(rec['ticker'], period="6mo")
+                            if chart:
+                                st.plotly_chart(chart, use_container_width=True)
+                            
+                            # Get and display analyst writeup
+                            st.subheader("Analyst Write-up")
+                            writeup = get_analyst_writeup(rec['ticker'], model_type)
+                            if writeup:
+                                st.markdown(writeup)
                                 
-                                # Add technical chart
-                                st.subheader("Technical Analysis")
-                                chart = plot_stock_history(rec['ticker'], period="6mo")
-                                if chart:
-                                    st.plotly_chart(chart, use_container_width=True)
-                                
-                                # Get and display analyst writeup
-                                st.subheader("Analyst Write-up")
-                                writeup = get_analyst_writeup(rec['ticker'], model_type)
-                                if writeup:
-                                    st.markdown(writeup)
-                                    
     except Exception as e:
         st.error(f"Error in recommendations tab: {str(e)}")
 

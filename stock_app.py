@@ -689,31 +689,35 @@ def main():
                 st.error(f"Error loading stock data: {str(e)}")
     
     # Create tabs with original structure
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Company Profile",
-        "Technical Analysis",
-        "Stock Prediction",
-        "Buffett Analysis",
-        "Options Analysis",
-        "Market Movers"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📊 Overview",
+        "📈 Technical Analysis",
+        "💰 Options Analysis",
+        "🎯 Stock Recommendations",
+        "🎩 Buffett Analysis",
+        "📱 Company Profile",
+        "🔥 Market Movers"
     ])
     
     with tab1:
-        company_profile_tab()
+        overview_tab()
     
     with tab2:
         technical_analysis_tab()
-    
+        
     with tab3:
-        prediction_tab()
-    
-    with tab4:
-        buffett_analysis_tab()
-    
-    with tab5:
         options_analysis_tab()
-    
+        
+    with tab4:
+        stock_recommendations_tab()
+        
+    with tab5:
+        buffett_analysis_tab()
+        
     with tab6:
+        company_profile_tab()
+        
+    with tab7:
         market_movers_tab()
 
 if __name__ == "__main__":

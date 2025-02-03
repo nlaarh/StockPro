@@ -191,81 +191,120 @@ def plot_stock_analysis(ticker):
 
 def stock_recommendations_tab():
     """Display stock recommendations tab"""
-    st.subheader("Stock Recommendations")
+    st.header("🎯 Stock Recommendations")
     
     # Create tabs
-    tab1, tab2 = st.tabs(["Top Recommendations", "Detailed Analysis"])
+    tab1, tab2 = st.tabs(["📈 Top Recommendations", "🔍 Detailed Analysis"])
     
     with tab1:
         # Model selection
-        model = st.selectbox(
-            "Select Analysis Model",
-            ["ollama", "deepseek"],
-            help="Choose the model to generate stock recommendations"
-        )
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            model = st.selectbox(
+                "Select Analysis Model",
+                ["Traditional", "Ollama 3.2"],
+                help="Traditional uses technical and fundamental analysis. Ollama 3.2 uses AI for more nuanced analysis."
+            )
         
-        # Get recommendations
-        recommendations = get_stock_recommendations(model)
+        with col2:
+            refresh = st.button("🔄 Refresh Analysis")
         
-        if recommendations:
-            # Display recommendations table
-            st.markdown("### Top 5 Stock Recommendations")
-            
-            for i, rec in enumerate(recommendations, 1):
-                with st.expander(f"{i}. {rec['Company']} ({rec['Ticker']})"):
-                    col1, col2, col3 = st.columns(3)
+        if refresh or 'recommendations' not in st.session_state:
+            with st.spinner("Analyzing stocks..."):
+                if model == "Traditional":
+                    recommendations = get_stock_recommendations()
+                else:
+                    recommendations = get_stock_recommendations_ollama()
+                st.session_state.recommendations = recommendations
+        
+        if st.session_state.recommendations:
+            # Display recommendations in cards
+            for rec in st.session_state.recommendations:
+                with st.container():
+                    col1, col2, col3 = st.columns([1, 2, 1])
                     
                     with col1:
-                        st.metric("Price", f"${rec['Price']:.2f}", f"{rec['Change %']:.1f}%")
+                        st.subheader(f"${rec['Ticker']}")
+                        price_change = rec['Change %']
+                        st.metric(
+                            "Price",
+                            f"${rec['Price']:.2f}",
+                            f"{price_change:+.2f}%" if price_change else None,
+                            delta_color="normal"
+                        )
+                        
                     with col2:
-                        st.metric("Market Cap", format_large_number(rec['Market Cap']))
-                    with col3:
-                        st.metric("Total Score", f"{rec['Score']:.1f}")
+                        st.subheader(rec['Company'])
+                        st.caption(f"{rec['Sector']} | {rec['Industry']}")
+                        st.progress(rec['Score']/100, text=f"Overall Score: {rec['Score']:.0f}/100")
+                        tech_col, fund_col = st.columns(2)
+                        with tech_col:
+                            st.progress(rec['Technical Score']/100, text=f"Technical: {rec['Technical Score']:.0f}/100")
+                        with fund_col:
+                            st.progress(rec['Fundamental Score']/100, text=f"Fundamental: {rec['Fundamental Score']:.0f}/100")
                     
-                    st.markdown("#### Company Details")
-                    st.markdown(f"**Sector:** {rec['Sector']}")
-                    st.markdown(f"**Industry:** {rec['Industry']}")
-                    st.markdown("#### Analysis Scores")
-                    st.markdown(f"- Technical Score: {rec['Technical Score']:.1f}")
-                    st.markdown(f"- Fundamental Score: {rec['Fundamental Score']:.1f}")
-                    st.markdown("#### Business Description")
-                    st.markdown(rec['Description'][:500] + "...")
+                    with col3:
+                        st.metric("Market Cap", format_large_number(rec['Market Cap']))
+                        if st.button("📊 Analyze", key=f"analyze_{rec['Ticker']}"):
+                            st.session_state.current_ticker = rec['Ticker']
+                            st.experimental_rerun()
+                    
+                    # Expandable description
+                    with st.expander("📝 Company Description", expanded=False):
+                        st.write(rec['Description'])
+                    
+                st.markdown("---")
         else:
-            st.warning("Could not generate recommendations. Please try again.")
+            st.warning("No recommendations available. Try refreshing the analysis.")
     
     with tab2:
-        if recommendations:
-            # Stock selector
-            selected_ticker = st.selectbox(
-                "Select Stock for Detailed Analysis",
-                [rec['Ticker'] for rec in recommendations]
-            )
+        # Detailed analysis of a specific stock
+        ticker = st.text_input("Enter Stock Ticker:", value=st.session_state.get('current_ticker', ''))
+        
+        if ticker:
+            col1, col2 = st.columns(2)
             
-            if selected_ticker:
-                # Display detailed analysis
-                fig = plot_stock_analysis(selected_ticker)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+            with col1:
+                timeframe = st.selectbox(
+                    "Select Timeframe",
+                    ["1 Month", "3 Months", "6 Months", "1 Year", "2 Years", "5 Years"],
+                    index=3
+                )
+            
+            with col2:
+                indicators = st.multiselect(
+                    "Select Technical Indicators",
+                    ["Bollinger Bands", "RSI", "MACD", "Moving Averages"],
+                    default=["Bollinger Bands", "RSI"]
+                )
+            
+            # Plot stock analysis
+            fig = plot_stock_analysis(ticker)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Stock metrics
+                metrics = analyze_stock(ticker)
+                if metrics:
+                    col1, col2, col3, col4 = st.columns(4)
                     
-                # Get stock info
-                stock = yf.Ticker(selected_ticker)
-                info = stock.info
-                
-                # Display key statistics
-                st.markdown("### Key Statistics")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Market Cap", format_large_number(info.get('marketCap', 0)))
-                    st.metric("P/E Ratio", f"{info.get('trailingPE', 0):.2f}")
-                with col2:
-                    st.metric("52W High", f"${info.get('fiftyTwoWeekHigh', 0):.2f}")
-                    st.metric("52W Low", f"${info.get('fiftyTwoWeekLow', 0):.2f}")
-                with col3:
-                    st.metric("Dividend Yield", f"{info.get('dividendYield', 0) * 100:.2f}%")
-                    st.metric("Beta", f"{info.get('beta', 0):.2f}")
-        else:
-            st.warning("Please generate recommendations first.")
+                    with col1:
+                        st.metric("RSI", f"{metrics['RSI']:.1f}")
+                    with col2:
+                        st.metric("MACD", f"{metrics['MACD']:.2f}")
+                    with col3:
+                        st.metric("P/E Ratio", f"{metrics['P/E Ratio']:.1f}")
+                    with col4:
+                        st.metric("Dividend Yield", f"{metrics['Dividend Yield']:.1f}%")
+                    
+                    # Analyst writeup
+                    if model == "Ollama 3.2":
+                        with st.expander("📝 AI Analyst Report", expanded=True):
+                            writeup = get_analyst_writeup(ticker)
+                            if writeup:
+                                st.markdown(writeup)
+            else:
+                st.error(f"Could not fetch data for {ticker}")
 
 def test_ollama_connection(model_type):
     """Test connection to Ollama server and model availability"""
